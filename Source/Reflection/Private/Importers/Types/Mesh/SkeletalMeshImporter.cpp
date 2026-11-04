@@ -485,16 +485,32 @@ bool ISkeletalMeshImporter::Import() {
 	 * draws a thumbnail from, and posing one for that thumbnail reads the first entry of a required
 	 * bone list the engine never filled in: the editor goes down with it. Nothing is created until
 	 * the geometry is in hand, so a Cloud that isn't running leaves the last import standing. */
-	const TSharedPtr<FJsonObject> Geometry = Cloud::Export::GetLodModelBlocking(FetchPath);
+	FString Failure;
+	const TSharedPtr<FJsonObject> Geometry = Cloud::Export::GetLodModelBlocking(FetchPath, &Failure);
 
 	if (!Geometry.IsValid()) {
+		/* Asked for the long answer while the Cloud still has the mesh open: which build the
+		 * profile reads as, what the package is, and what every LOD's buffers came back as */
+		const FString Diagnosis = Cloud::Export::DiagnoseMeshBlocking(FetchPath, GetAssetName());
+
 		FImportIssues::Report(
 			EImportIssue::Failed,
 			TEXT("No geometry from the Cloud"),
-			TEXT("The Cloud has to be running, and the mesh needs cooked render data to read.")
+			FString::Printf(TEXT("Asked for \"%s\": %s.%s"), *FetchPath, *Failure,
+				Diagnosis.IsEmpty()
+					? TEXT(" The Cloud has to be running, and the mesh needs cooked render data to read.")
+					: *FString::Printf(TEXT(" The Cloud's diagnosis is in the Output Log and written to \"%s\"."), *Diagnosis))
 		);
 
 		return false;
+	}
+
+	if (double CookedLods = 0.0; Geometry->TryGetNumberField(TEXT("cookedLods"), CookedLods) && CookedLods > 0.0) {
+		const TArray<TSharedPtr<FJsonValue>>* Served;
+
+		if (Geometry->TryGetArrayField(TEXT("lods"), Served) && Served->Num() < CookedLods) {
+			UE_LOG(LogReflection, Warning, TEXT("\"%s\": the Cloud served %d of the %d LOD(s) the game cooked"), *GetAssetName(), Served->Num(), static_cast<int32>(CookedLods));
+		}
 	}
 
 	USkeletalMesh* SkeletalMesh = Create<USkeletalMesh>();

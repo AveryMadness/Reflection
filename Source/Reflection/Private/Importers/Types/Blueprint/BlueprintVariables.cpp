@@ -240,6 +240,25 @@ TSet<FString> FBlueprintVariables::GetComponentVariables(FUObjectExportContainer
 		}
 	}
 
+	/* A timeline is a component the compiler declares from the template, the same way it declares
+	 * one from a construction script node. Declared here as well, the compile stops on the second
+	 * property of that name. */
+	for (const FUObjectExport* Export : Container->Exports) {
+		if (Export == nullptr || !Export->IsJsonValid()) continue;
+
+		FString Type;
+
+		if (!Export->JsonObject->TryGetStringField(TEXT("Type"), Type) || Type != TEXT("TimelineTemplate")) continue;
+
+		const TSharedPtr<FJsonObject>* Properties;
+
+		if (!Export->JsonObject->TryGetObjectField(TEXT("Properties"), Properties)) continue;
+
+		if (FString Called; (*Properties)->TryGetStringField(TEXT("VariableName"), Called) && !Called.IsEmpty()) {
+			Named.Add(Called);
+		}
+	}
+
 	return Named;
 }
 

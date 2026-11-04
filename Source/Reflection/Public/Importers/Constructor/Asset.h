@@ -20,6 +20,9 @@ public:
 	 * A skeleton is still fetched: a skeletal mesh has nothing to build against without one. */
 	static inline bool bImportReferences = true;
 
+	/* Off, a blueprint's graphs are not read back out of its bytecode; they are written separately. */
+	static inline bool bConstructGraphs = true;
+
 	/* What has already been reflected during the import now running.
 	 *
 	 * A material naming the same texture in two slots asks for it twice, and with existing textures

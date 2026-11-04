@@ -43,6 +43,78 @@
 #include "ScriptDisassembler.h"
 #include "Importers/Types/Blueprint/BlueprintCookedMetaData.h"
 #include "Importers/Types/Blueprint/BytecodeGraph.h"
+#include "Importers/Constructor/Asset.h"
+
+/* Every "Class'Owner:Member'" written anywhere under a json value, answered as the owners */
+static void CollectNativeOwners(const TSharedPtr<FJsonValue>& Value, TSet<FString>& Owners) {
+	if (!Value.IsValid()) return;
+
+	if (Value->Type == EJson::Object) {
+		const TSharedPtr<FJsonObject> Object = Value->AsObject();
+
+		FString ObjectName;
+		FString ObjectPath;
+
+		if (Object->TryGetStringField(TEXT("ObjectName"), ObjectName) && Object->TryGetStringField(TEXT("ObjectPath"), ObjectPath) && ObjectPath.StartsWith(TEXT("/Script/"))) {
+			/* Class'Owner:Member' -> Owner */
+			FString Inner = ObjectName;
+
+			if (Inner.Split(TEXT("'"), nullptr, &Inner)) {
+				Inner.RemoveFromEnd(TEXT("'"));
+
+				FString Owner;
+
+				if (Inner.Split(TEXT(":"), &Owner, nullptr) && !Owner.IsEmpty()) {
+					Owners.Add(Owner);
+				}
+			}
+		}
+
+		for (const auto& Pair : Object->Values) {
+			CollectNativeOwners(Pair.Value, Owners);
+		}
+	} else if (Value->Type == EJson::Array) {
+		for (const TSharedPtr<FJsonValue>& Element : Value->AsArray()) {
+			CollectNativeOwners(Element, Owners);
+		}
+	}
+}
+
+UClass* IBlueprintImporter::InferParentClass() const {
+	if (GetContainer() == nullptr) return nullptr;
+
+	TSet<FString> Owners;
+
+	for (const FUObjectExport* Export : GetContainer()->Exports) {
+		if (Export == nullptr || !Export->IsJsonValid()) continue;
+
+		CollectNativeOwners(MakeShared<FJsonValueObject>(Export->JsonObject), Owners);
+	}
+
+	TArray<UClass*> Candidates;
+
+	for (const FString& Owner : Owners) {
+		UClass* Found = FindClassByType(Owner);
+
+		if (Found != nullptr && Found->IsNative() && !Found->IsChildOf(UStruct::StaticClass()) && !Found->HasAnyClassFlags(CLASS_Interface)) {
+			Candidates.AddUnique(Found);
+		}
+	}
+
+	/* The most derived one, and only where the rest sit above it: two unrelated classes say the
+	 * functions were called on something else, and nothing can be made of that */
+	UClass* Deepest = nullptr;
+
+	for (UClass* Candidate : Candidates) {
+		if (Deepest == nullptr || Candidate->IsChildOf(Deepest)) {
+			Deepest = Candidate;
+		} else if (!Deepest->IsChildOf(Candidate)) {
+			return nullptr;
+		}
+	}
+
+	return Deepest;
+}
 #include "Importers/Constructor/TypesHelper.h"
 
 UObject* IBlueprintImporter::CreateAsset(UObject* CreatedAsset) {
@@ -282,6 +354,16 @@ int32 IBlueprintImporter::ConstructInterfaces() {
 		if (Called.IsEmpty()) continue;
 
 		UClass* Interface = const_cast<UClass*>(FindClassByType(Called));
+
+		/* Already in the project, and not loaded yet.
+		 *
+		 * The search above only sees classes in memory, and a blueprint's class is in memory once
+		 * something has loaded its package. Nothing has by the time the interfaces are answered
+		 * for: they come first, before the graphs whose nodes would have loaded them. Asked of the
+		 * disk instead, an interface reflected in an earlier run is found where it was saved. */
+		if (Interface == nullptr && Named.Has(TEXT("ObjectPath"))) {
+			Interface = LoadBlueprintClassFromDisk(ToEditorPackagePath(Named.GetString(TEXT("ObjectPath"))), Called);
+		}
 
 		/* Brought in where the project hasn't got it. An interface is an asset like any other, and
 		 * a blueprint cannot answer for one that is not here. */

@@ -6,6 +6,8 @@
 #include "Utilities/JsonHelpers.h"
 #endif
 
+DEFINE_LOG_CATEGORY_STATIC(LogSkeletonImporter, Log, All);
+
 UObject* ISkeletonImporter::CreateAsset(UObject* CreatedAsset) {
 	return IImporter::CreateAsset(NewObject<USkeleton>(GetPackage(), USkeleton::StaticClass(), *GetAssetName(), RF_Public | RF_Standalone));
 }
@@ -37,7 +39,10 @@ bool ISkeletonImporter::Import() {
 		}
 
 		Skeleton->RemoveVirtualBones(VirtualBoneNames);
-		Skeleton->AnimRetargetSources.Empty();
+
+		/* AnimRetargetSources is emptied where it is replaced, not here: it used to be cleared up front and
+		 * then read from a field the export does not carry, so a re-import silently threw away every
+		 * retarget source and left the animations retargeting against the skeleton's own reference pose. */
 
 		/* An existing skeleton can be missing bones, for instance one made empty as a stand-in before its own
 		 * import ran. Without them every animation imported against it has nothing to move, so any bone the
@@ -197,7 +202,29 @@ void ISkeletonImporter::ApplySkeletalAssetData(USkeleton* Skeleton) const {
 #endif
 	
 	/* AnimRetargetSources ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~ */
-	const TSharedPtr<FJsonObject> AnimRetargetSources = GetAssetData()->GetObjectField(TEXT("AnimRetargetSources"));
+
+	/* AnimRetargetSources is not a UPROPERTY - USkeleton::Serialize writes it itself - so where it lands
+	 * in an export depends on the writer: beside ReferenceSkeleton and Guid at the export's top level,
+	 * or inside Properties. Look in both, and leave the skeleton's existing sources alone when neither
+	 * carries it, rather than dereferencing a field that is not there. */
+	const TSharedPtr<FJsonObject>* AnimRetargetSourcesPtr = nullptr;
+	if (!AssetExport->JsonObject->TryGetObjectField(TEXT("AnimRetargetSources"), AnimRetargetSourcesPtr)
+		&& !GetAssetData()->TryGetObjectField(TEXT("AnimRetargetSources"), AnimRetargetSourcesPtr)) {
+		AnimRetargetSourcesPtr = nullptr;
+	}
+
+	if (!AnimRetargetSourcesPtr || !AnimRetargetSourcesPtr->IsValid()) {
+		UE_LOG(LogSkeletonImporter, Log, TEXT("%s: export carries no AnimRetargetSources, keeping the %d already on the skeleton"),
+			*Skeleton->GetName(), Skeleton->AnimRetargetSources.Num());
+
+		RebuildSkeleton(Skeleton);
+
+		return;
+	}
+
+	const TSharedPtr<FJsonObject> AnimRetargetSources = *AnimRetargetSourcesPtr;
+
+	Skeleton->AnimRetargetSources.Empty();
 
 	for (const TPair<FString, TSharedPtr<FJsonValue>>& Pair : AnimRetargetSources->Values) {
 		const FName KeyName = FName(*Pair.Key);
@@ -228,6 +255,8 @@ void ISkeletonImporter::ApplySkeletalAssetData(USkeleton* Skeleton) const {
 
 		Skeleton->AnimRetargetSources.Add(KeyName, RetargetSource);
 	}
+
+	UE_LOG(LogSkeletonImporter, Log, TEXT("%s: imported %d retarget source(s)"), *Skeleton->GetName(), Skeleton->AnimRetargetSources.Num());
 
 	RebuildSkeleton(Skeleton);
 }

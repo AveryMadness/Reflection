@@ -1,3 +1,4 @@
+#include "Importers/Constructor/Asset.h"
 /* Copyright Reflection Contributors 2024-2026 */
 
 #include "Importers/Constructor/ImportJob.h"
@@ -193,7 +194,15 @@ namespace {
 			if (Export == nullptr) continue;
 			if (GJob->bBlueprintOnly && Export->GetType() != "BlueprintGeneratedClass") continue;
 
-			IImportReader::ReadExportAndImport(GJob->Container, Export, GJob->CurrentFile);
+			{
+				/* One import, however many references it reaches through: without the scope held
+				 * here, the first reference wipes what the run had recorded and every reference
+				 * after it is fetched again, an animation blueprint recompiled once per node that
+				 * names it */
+				const FAssetUtilities::FRunScope RunScope;
+
+				IImportReader::ReadExportAndImport(GJob->Container, Export, GJob->CurrentFile);
+			}
 
 			KeepContainerObjects();
 		} while (FPlatformTime::Seconds() - SliceStart < SliceBudgetSeconds);

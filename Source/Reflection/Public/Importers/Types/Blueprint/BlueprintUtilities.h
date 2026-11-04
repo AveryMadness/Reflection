@@ -10,6 +10,14 @@
 #include "Importers/Constructor/Importer.h"
 #include "Modules/Toolbar/Tools/ImportFromPath.h"
 #include "UObject/CoreRedirects.h"
+#include "Importers/Constructor/Asset.h"
+#include "Modules/Cloud/Cloud.h"
+#include "Engine/Blueprint.h"
+#include "Misc/PackageName.h"
+#include "Engine/Log.h"
+#include "Serialization/ArchiveReplaceObjectRef.h"
+#include "UObject/UObjectIterator.h"
+#include "UObject/UnrealType.h"
 
 /* 4.25 and below build this module without the engine's shared PCH (see Reflection.Build.cs),
  * which is where the blueprint function library type used to come in from */
@@ -141,6 +149,18 @@ inline TSubclassOf<UObject> LoadClassFromPath(const FString& ObjectName, const F
 			return Renamed;
 		}
 	}
+
+	/* A native class is already in memory once its module is, whatever the path lookup made of
+	 * the spelling it was given, so it is asked for by name before giving up */
+	if (UClass* NamedClass = FindClassByType(ObjectName)) {
+		if (NamedClass->IsNative()) return NamedClass;
+	}
+
+	if (UClass* Loaded = StaticLoadClass(UObject::StaticClass(), nullptr, *FullPath, nullptr, LOAD_NoWarn | LOAD_Quiet)) {
+		return Loaded;
+	}
+
+	UE_LOG(LogReflection, Error, TEXT("no class answers to \"%s\" (asked for as \"%s\", then by name, then loaded)"), *FullPath, *ObjectName);
 
 	return nullptr;
 }
@@ -295,4 +315,149 @@ inline FUObjectExport* GetClassDefaultObject(FUObjectExportContainer* AssetConta
 	}
 
 	return Export;
+}
+
+/* Classes and structs cannot live under an object whose class is reinstanced.
+ *
+ * Compiling a blueprint reinstances its generated class's CDO. That reinstancer copies every
+ * subobject the old CDO owned under the new one (FObjectReinstancer::SaveClassData,
+ * DuplicateObject, StaticAllocateObject). StaticAllocateObject will not make a UStruct or a
+ * UClass under anything that is not a package, so the moment a CDO owns a struct or a class
+ * DuplicateObject asserts:
+ *
+ *     "Objects of type 'UserDefinedStruct' may only be created in packages"
+ *
+ * The things that trigger it:
+ *
+ *   - A component whose outer is the CDO and which owns an anonymous class or a struct
+ *   - A deserialized UObject whose property value was a UUserDefinedStruct* and which got
+ *     instanced under the CDO rather than referenced in its package
+ *   - Any child object created with the CDO as its outer that is, or contains, a struct
+ *
+ * Before every compile of a blueprint that has had its CDO populated, we walk every object
+ * whose outer is that CDO. Anything that is a UStruct is renamed into the transient package,
+ * severed from the CDO's properties, and marked for garbage collection. */
+inline int32 EvictStructsFromDefaults(UBlueprint* Blueprint, const TCHAR* Stage) {
+	if (Blueprint == nullptr || Blueprint->GeneratedClass == nullptr) return 0;
+
+	UObject* Defaults = Blueprint->GeneratedClass->GetDefaultObject(false);
+
+	if (Defaults == nullptr) return 0;
+
+	UE_LOG(LogReflection, Verbose, TEXT("%s: blueprint \"%s\" (class %s, outer %s, super %s, skel %s): defaults are at \"%s\" (a %s%s)"),
+		Stage,
+		*Blueprint->GetName(),
+		*Blueprint->GeneratedClass->GetClass()->GetName(),
+		*GetNameSafe(Blueprint->GeneratedClass->GetOuter()),
+		*GetPathNameSafe(Blueprint->GeneratedClass->GetSuperClass()),
+		*GetPathNameSafe(Blueprint->SkeletonGeneratedClass),
+		*Defaults->GetPathName(),
+		*Defaults->GetClass()->GetPathName(),
+		Defaults->IsA<UStruct>() ? TEXT(" - WHICH IS A STRUCT") : TEXT(""));
+
+	/* Every class kept anywhere but in a package, since a class under an object is the one thing
+	 * reinstancing cannot copy */
+	for (TObjectIterator<UClass> It; It; ++It) {
+		UClass* Class = *It;
+
+		if (Class == nullptr || Class->GetOuter() == nullptr || Class->GetOuter()->IsA<UPackage>()) continue;
+
+		UE_LOG(LogReflection, Warning, TEXT("%s: class \"%s\" (a %s, size %d) is kept under \"%s\" (a %s)"),
+			Stage,
+			*Class->GetName(),
+			*Class->GetClass()->GetName(),
+			Class->GetStructureSize(),
+			*Class->GetOuter()->GetPathName(),
+			*Class->GetOuter()->GetClass()->GetName());
+	}
+
+	TArray<UObject*> Kept;
+	GetObjectsWithOuter(Defaults, Kept, true);
+
+	int32 Evicted = 0;
+
+	for (UObject* One : Kept) {
+		if (One == nullptr) continue;
+
+		/* Every referrer among the defaults' own properties, so the log says which one it came in through */
+		FString Through;
+
+		for (TFieldIterator<FObjectPropertyBase> It(Defaults->GetClass()); It; ++It) {
+			for (int32 Index = 0; Index < It->ArrayDim; ++Index) {
+				if (It->GetObjectPropertyValue_InContainer(Defaults, Index) == One) {
+					Through += (Through.IsEmpty() ? TEXT("") : TEXT(", ")) + It->GetName();
+				}
+			}
+		}
+
+		const bool bStruct = One->IsA<UStruct>();
+
+		const FString Said = FString::Printf(TEXT("%s: the defaults of \"%s\" keep \"%s\" (a %s%s%s%s)"),
+			Stage,
+			*Blueprint->GetName(),
+			*One->GetPathName(Defaults),
+			*One->GetClass()->GetName(),
+			One->IsDefaultSubobject() ? TEXT(", default subobject") : TEXT(""),
+			Through.IsEmpty() ? TEXT("") : TEXT(", through "),
+			*Through);
+
+		if (bStruct) {
+			UE_LOG(LogReflection, Warning, TEXT("%s"), *Said);
+		} else {
+			UE_LOG(LogReflection, Display, TEXT("%s"), *Said);
+		}
+
+		if (!bStruct) continue;
+
+		UE_LOG(LogReflection, Warning, TEXT("%s: \"%s\" cannot be reinstanced under the defaults, so it was moved aside"), Stage, *One->GetName());
+
+		/* Every reference from the defaults is cleared first, so the reinstancer does not find it
+		 * through a property and go looking for it where it no longer is */
+		TMap<UObject*, UObject*> Cleared;
+		Cleared.Add(One, nullptr);
+
+		FArchiveReplaceObjectRef<UObject> Clear(Defaults, Cleared, EArchiveReplaceObjectFlags::IgnoreOuterRef | EArchiveReplaceObjectFlags::IgnoreArchetypeRef);
+
+		One->Rename(nullptr, GetTransientPackage(), REN_DontCreateRedirectors | REN_DoNotDirty | REN_NonTransactional | REN_ForceNoResetLoaders);
+		One->ClearFlags(RF_Public | RF_Standalone);
+		One->SetFlags(RF_Transient);
+		One->MarkAsGarbage();
+
+		Evicted++;
+	}
+
+	return Evicted;
+}
+
+/* A blueprint's class, loaded from the package the project keeps it in.
+ *
+ * Given where the export says the asset is ("/Game/Path/Asset.0" or "/Game/Path/Asset.Asset_C")
+ * and what its class is called, loads the package if it is on disk and hands back the generated
+ * class. Nothing is fetched: an asset that is not in the project is somebody else's to bring in. */
+inline UClass* LoadBlueprintClassFromDisk(FString Where, const FString& ClassName) {
+	/* An export is named by its package and the number it sits at, and the number is no part of
+	 * where the editor keeps it */
+	if (int32 Sits; Where.FindLastChar(TEXT('.'), Sits)) {
+		const FString After = Where.RightChop(Sits + 1);
+
+		if (!After.IsEmpty() && (After.IsNumeric() || After.EndsWith(TEXT("_C")))) Where.LeftInline(Sits);
+	}
+
+	if (Where.IsEmpty() || !FPackageName::IsValidLongPackageName(Where) || !FPackageName::DoesPackageExist(Where)) {
+		return nullptr;
+	}
+
+	FString Leaf = Where;
+
+	if (int32 Slash; Where.FindLastChar(TEXT('/'), Slash)) Leaf = Where.RightChop(Slash + 1);
+
+	if (const UBlueprint* Blueprint = LoadObject<UBlueprint>(nullptr, *(Where + TEXT(".") + Leaf))) {
+		if (Blueprint->GeneratedClass != nullptr) return Blueprint->GeneratedClass.Get();
+	}
+
+	FString Called = ClassName;
+
+	if (!Called.EndsWith(TEXT("_C"))) Called += TEXT("_C");
+
+	return LoadObject<UClass>(nullptr, *(Where + TEXT(".") + Called));
 }

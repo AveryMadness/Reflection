@@ -38,6 +38,18 @@ private:
 	/* Finds an Animation Graph in an Animation Blueprint */
 	static UEdGraph* FindAnimGraph(UAnimBlueprint* AnimBlueprint);
 
+	/* Which kind of node a class property is, read off its name */
+	static FString NodeKindFromKey(const FString& Key);
+
+	/* Whether the class declares a layer of its own by this name */
+	bool IsSelfLayerFunction(const FString& Named) const;
+
+	/* The enum a blend-by-enum switches on, worked out from what feeds it */
+	UEnum* InferBlendListEnum(UAnimGraphNode_BlendListByEnum* Node, const TSharedPtr<FJsonObject>& Properties) const;
+
+	/* Says what a linked graph or layer runs, the way this engine keeps it */
+	static void SettleLinkedGraph(UAnimGraphNode_Base* Node, const TSharedPtr<FJsonObject>& Properties);
+
 	/* Using [AnimNodeProperties] that is filled with animation nodes, create new nodes, and the Outer being [AnimGraph], then add it to the [Container] */
 	void CreateGraph(const TSharedPtr<FJsonObject>& AnimNodeProperties, UEdGraph* AnimGraph, FUObjectExportContainer* Container);
 
@@ -51,7 +63,7 @@ private:
 	void HandleNodeDeserialization(FUObjectExportContainer* Container);
 
 	/* Links Animation Graph Nodes together using a container */
-	static void ConnectAnimGraphNodes(FUObjectExportContainer* Container, UEdGraph* AnimGraph);
+	void ConnectAnimGraphNodes(FUObjectExportContainer* Container, UEdGraph* AnimGraph);
 
 	/* Reads how the class folded its nodes' values away, and where it keeps them */
 	void ReadFolded(const TSharedPtr<FJsonObject>& Nodes, const TArray<FString>& Keys);
@@ -86,7 +98,7 @@ protected:
 	void ShowBoundPins(const TSharedPtr<FJsonObject>& AnimNodeProperties, FUObjectExportContainer* Container) const;
 
 	/* Draws a variable, and a Not where it was turned round, into the graph a node is in */
-	void Draw(UAnimGraphNode_Base* Node, FName Member, const FString& Named, bool bTurned, int32 Row) const;
+	void Draw(UAnimGraphNode_Base* Node, FName Member, const TArray<FString>& Path, bool bTurned, int32 Row) const;
 
 	/* Draws a property on the node so something can be wired to it, and says whether it had to */
 	bool Expose(UAnimGraphNode_Base* Node, FName Member) const;
@@ -118,6 +130,12 @@ protected:
 	/* Points each borrowed cached pose at the node that saved it, once every graph has been made */
 	void SettleCachedPoses();
 
+	/* Holds the class's node list against what is standing in the graphs, and reports the difference */
+	void AuditNodes();
+
+	/* Puts the class's node tags back on the nodes they name, once every graph has been made */
+	void TagNodes();
+
 	/* Turns each call to an anim getter back into the getter node, once every graph has been made */
 	void SettleAnimGetters();
 
@@ -130,7 +148,7 @@ protected:
 	/* Each cached pose borrowed, and the name of the node said to have saved it */
 	TArray<TPair<TWeakObjectPtr<class UAnimGraphNode_UseCachedPose>, FString>> Borrowed;
 
-	static void UpdateBlendListByEnumVisibleEntries(FUObjectExport* NodeExport, FUObjectExportContainer* Container, UEdGraph* AnimGraph);
+	void UpdateBlendListByEnumVisibleEntries(FUObjectExport* NodeExport, FUObjectExportContainer* Container, UEdGraph* AnimGraph);
 	
 protected:
 	/* Global Cached data to reuse */

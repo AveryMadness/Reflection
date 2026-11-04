@@ -91,13 +91,26 @@ int32 UBlueprintImportCommandlet::Main(const FString& Params) {
 		return 0;
 	}
 
-	FString Path;
+	FString Path, File;
+	IImporter* Importer = nullptr;
 
-	if (!FParse::Value(*Params, TEXT("path="), Path) || Path.IsEmpty()) {
-		UE_LOG(LogBlueprintImport, Error, TEXT("no asset to import: pass -path=<cloud asset path>"));
+	/* From an export already on disk, read the way the editor reads one dropped on it */
+	if (FParse::Value(*Params, TEXT("file="), File) && !File.IsEmpty()) {
+		UE_LOG(LogBlueprintImport, Display, TEXT("importing \"%s\" from disk"), *File);
 
-		return 1;
-	}
+		Importer = IImportReader::ImportReference(File);
+
+		if (Importer == nullptr) {
+			UE_LOG(LogBlueprintImport, Error, TEXT("nothing was made from \"%s\""), *File);
+
+			return 1;
+		}
+	} else {
+		if (!FParse::Value(*Params, TEXT("path="), Path) || Path.IsEmpty()) {
+			UE_LOG(LogBlueprintImport, Error, TEXT("no asset to import: pass -path=<cloud asset path> or -file=<export json>"));
+
+			return 1;
+		}
 
 	/* Only the one blueprint, with what it names left to whatever the project already has.
 	 *
@@ -172,6 +185,7 @@ int32 UBlueprintImportCommandlet::Main(const FString& Params) {
 		UE_LOG(LogBlueprintImport, Error, TEXT("nothing was made from \"%s\""), *Path);
 
 		return 1;
+	}
 	}
 
 	/* Saved, because the asset on disk is what the comparison reads */

@@ -114,12 +114,34 @@ bool IStaticMeshImporter::Import() {
 
 	/* Said by name as well as by path. A package holding one mesh answers the same either way; one
 	 * holding several would otherwise hand the first mesh's geometry back for every one of them. */
-	const TSharedPtr<FJsonObject> Geometry = Cloud::Export::GetStaticMeshBlocking(FetchPath, GetAssetName());
+	FString Failure;
+	const TSharedPtr<FJsonObject> Geometry = Cloud::Export::GetStaticMeshBlocking(FetchPath, GetAssetName(), &Failure);
 
 	if (!Geometry.IsValid()) {
-		FImportIssues::Report(EImportIssue::Failed, TEXT("No geometry from the Cloud"), TEXT("The Cloud has to be running, and the mesh needs cooked render data to read."));
+		/* Asked for the long answer while the Cloud still has the mesh open: which build the
+		 * profile reads as, what the package is, and what every LOD's buffers came back as */
+		const FString Diagnosis = Cloud::Export::DiagnoseMeshBlocking(FetchPath, GetAssetName());
+
+		FImportIssues::Report(
+			EImportIssue::Failed,
+			TEXT("No geometry from the Cloud"),
+			FString::Printf(TEXT("Asked for \"%s\": %s.%s"), *FetchPath, *Failure,
+				Diagnosis.IsEmpty()
+					? TEXT(" The Cloud has to be running, and the mesh needs cooked render data to read.")
+					: *FString::Printf(TEXT(" The Cloud's diagnosis is in the Output Log and written to \"%s\"."), *Diagnosis))
+		);
 
 		return Abandon();
+	}
+
+	/* Served some of what the cook wrote and not all of it: said here, since a mesh that comes in
+	 * with fewer LODs than the game has is easy to miss */
+	if (double CookedLods = 0.0; Geometry->TryGetNumberField(TEXT("cookedLods"), CookedLods) && CookedLods > 0.0) {
+		const TArray<TSharedPtr<FJsonValue>>* Served;
+
+		if (Geometry->TryGetArrayField(TEXT("lods"), Served) && Served->Num() < CookedLods) {
+			UE_LOG(LogReflection, Warning, TEXT("\"%s\": the Cloud served %d of the %d LOD(s) the game cooked"), *GetAssetName(), Served->Num(), static_cast<int32>(CookedLods));
+		}
 	}
 
 	const TArray<TSharedPtr<FJsonValue>>* Slots;

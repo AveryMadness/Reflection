@@ -147,7 +147,8 @@ TObjectPtr<T> IImporter::DownloadWrapper(TObjectPtr<T> InObject, FString Type, c
 
     if ((
         InObject == nullptr ||
-            (Settings->AssetSettings.Texture.ReflectExistingTextures && Type == "Texture2D")
+            (Settings->AssetSettings.Texture.ReflectExistingTextures && Type == "Texture2D") ||
+            (Settings->AssetSettings.AnimationBlueprint.ReflectExistingAnimationBlueprints && Type == "AnimBlueprintGeneratedClass")
         )
         && !Path.StartsWith("Engine/") && !Path.StartsWith("/Engine/")
     ) {
@@ -346,8 +347,9 @@ void IImporter::LoadExport(const TSharedPtr<FJsonObject>* PackageIndex, TObjectP
 		}
 	}
 
-	/* If object is still null, send off to Cloud to download */
-	if (!Object) {
+	/* If object is still null, send off to Cloud to download. An animation blueprint already here
+	 * goes too when the settings say so, since one import is meant to rebuild the whole chain. */
+	if (!Object || (ObjectType == TEXT("AnimBlueprintGeneratedClass") && GetSettings()->AssetSettings.AnimationBlueprint.ReflectExistingAnimationBlueprints)) {
 		if (ObjectType == "WidgetBlueprintGeneratedClass") return;
 		
 		Object = DownloadWrapper(LoadedObject, ObjectType, ObjectName, ObjectPath, Lands, bWithin ? Spelled : FString());

@@ -2,6 +2,8 @@
 
 #include "Importers/Types/Blueprint/AnimationBlueprintImporter.h"
 #include "Importers/Types/Blueprint/BlueprintCompile.h"
+#include "AnimGraphNode_LinkedAnimGraphBase.h"
+#include "AnimGraphNode_LinkedAnimLayer.h"
 #include "AnimGraphNode_BlendListByInt.h"
 /* 4.23 is where a node driving something of its own grew a base of its own */
 #if !UE4_22_BELOW
@@ -265,6 +267,45 @@ bool IAnimationBlueprintImporter::Import() {
 	
 	RootAnimNodeProperties = RootAnimNodeDefaults->GetObjectField(TEXT("Properties"));
 	if (!RootAnimNodeProperties.IsValid()) return false;
+
+	/* The animation blueprints this one links in, brought in before anything of this one is built.
+	 *
+	 * Reached while the class defaults are being read, a linked blueprint that has to be reflected
+	 * again is compiled in the middle of that read, and compiling it recompiles everything that
+	 * depends on it, this blueprint included: the default object being written to is thrown away
+	 * under the serializer. Fetched first, they are here already when the read gets to them. */
+	{
+		TSet<FString> Linked;
+
+		TFunction<void(const TSharedPtr<FJsonValue>&)> Look = [&](const TSharedPtr<FJsonValue>& Value) {
+			if (!Value.IsValid()) return;
+
+			if (Value->Type == EJson::Object) {
+				const TSharedPtr<FJsonObject> Object = Value->AsObject();
+
+				if (FString Named; Object->TryGetStringField(TEXT("ObjectName"), Named) && Named.StartsWith(TEXT("AnimBlueprintGeneratedClass'")) && Object->HasField(TEXT("ObjectPath"))) {
+					if (bool bSeen = false; !Named.Contains(GetAssetName() + TEXT("_C'"))) {
+						Linked.Add(Object->GetStringField(TEXT("ObjectPath")), &bSeen);
+
+						if (!bSeen) {
+							TObjectPtr<UObject> Fetched;
+							LoadExport<UObject>(&Object, Fetched);
+						}
+					}
+				}
+
+				for (const TPair<FString, TSharedPtr<FJsonValue>>& Field : Object->Values) Look(Field.Value);
+			} else if (Value->Type == EJson::Array) {
+				for (const TSharedPtr<FJsonValue>& One : Value->AsArray()) Look(One);
+			}
+		};
+
+		Look(MakeShared<FJsonValueObject>(RootAnimNodeProperties));
+
+		if (Linked.Num() > 0) {
+			UE_LOG(LogReflection, Display, TEXT("\"%s\" links %d animation blueprint(s), fetched ahead of it"), *GetAssetName(), Linked.Num());
+		}
+	}
 
 	/* The variables the blueprint declares have to exist before the class default object below can
 	 * put anything in them. ChildProperties holds them alongside the anim graph node state, which
@@ -723,6 +764,22 @@ bool IAnimationBlueprintImporter::Import() {
 			}
 		}
 
+		/* A layer of the blueprint's own.
+		 *
+		 * An interface brings its layers' graphs with it, but a blueprint can declare layers of its
+		 * own too, and those come from nowhere but the class: a function of the layer's name that
+		 * hands back a pose and takes the poses its input nodes are named after. Made the way the
+		 * editor makes one when somebody adds an animation layer. */
+		if (Layer == nullptr && IsSelfLayerFunction(One.Key)) {
+			Layer = FBlueprintEditorUtils::CreateNewGraph(AnimBlueprint, FName(*One.Key), UAnimationGraph::StaticClass(), UAnimationGraphSchema::StaticClass());
+
+			if (Layer != nullptr) {
+				FBlueprintEditorUtils::AddDomainSpecificGraph(AnimBlueprint, Layer);
+
+				UE_LOG(LogReflection, Display, TEXT("layer \"%s\" is the blueprint's own, so it was given a graph"), *One.Key);
+			}
+		}
+
 		if (Layer == nullptr) {
 			FImportIssues::Report(
 				EImportIssue::MissingClass,
@@ -759,6 +816,10 @@ bool IAnimationBlueprintImporter::Import() {
 
 	/* Now that there is every graph to look in */
 	SettleCachedPoses();
+
+	TagNodes();
+
+	AuditNodes();
 
 	/* And the rest of it, which is a blueprint's whatever else it is. The anim graph above is the
 	 * one part an animation blueprint keeps differently; its events were cooked to bytecode the
@@ -1558,29 +1619,11 @@ void IAnimationBlueprintImporter::ApplyBindings(const FString& Key, UAnimGraphNo
 	int32 Row = 0;
 
 	for (const FHandedOver& One : *Says) {
-		/* Drawn on the node whichever way it is fed.
-		 *
-		 * A property that is hidden reads as a property nobody set, and for one holding an asset
-		 * that is an error outright: the node points at an animation nobody has heard of. Being
-		 * handed a value settles that, and it settles it the same way whether the value is read
-		 * from one variable or reached through something so the pin is drawn either way, and
-		 * only how it is fed is decided below. */
-		if (Expose(Node, One.Member)) {
-			Node->ReconstructNode();
-		}
-
-		if (One.Path.Num() == 1) {
-			Draw(Node, One.Member, One.Path[0], One.bTurned, Row++);
-
-			continue;
-		}
-
-		/* Turned round, which a binding has no way of saying, so drawn whatever the way to it */
-		if (One.bTurned) {
-			if (!DrawTurnedThrough(Node, One.Member, One.Path, Row++)) {
-				UE_LOG(LogReflection, Warning, TEXT("\"%s\" is handed to %s.%s turned round, and could not be drawn"),
-					*FString::Join(One.Path, TEXT(".")), *Node->GetName(), *One.Member.ToString());
-			}
+		/* Turned round on the way, it has to be drawn: a binding hands the value over as it is, and
+		 * the Not that turns it is a node. Reached through a struct, the struct is broken open on
+		 * the way to it. */
+		if (One.Path.Num() == 1 || One.bTurned) {
+			Draw(Node, One.Member, One.Path, One.bTurned, Row++);
 
 			continue;
 		}
@@ -1592,6 +1635,12 @@ void IAnimationBlueprintImporter::ApplyBindings(const FString& Key, UAnimGraphNo
 		Binding.PropertyPath = One.Path;
 		Binding.PathAsText = FText::FromString(FString::Join(One.Path, TEXT(".")));
 		Binding.bIsBound = true;
+
+		/* An element of an array pin carries its place in the name ("BlendWeights_0"), which the
+		 * engine reads back off the name's number the same way */
+		if (One.Member.GetNumber() > 0) {
+			Binding.ArrayIndex = One.Member.GetNumber() - 1;
+		}
 
 		/* The pin settles what it carries, which the way to it does not say */
 		if (const UEdGraphPin* Pin = Node->FindPin(One.Member, EGPD_Input)) {
@@ -1605,7 +1654,6 @@ void IAnimationBlueprintImporter::ApplyBindings(const FString& Key, UAnimGraphNo
 #endif
 	}
 }
-
 void IAnimationBlueprintImporter::ExposeHandedOver(UAnimGraphNode_Base* Node, const TArray<FString>& Named) const {
 	/* Taken by reflection, since the node keeps the list to itself */
 	const FArrayProperty* Exposed = FindFProperty<FArrayProperty>(Node->GetClass(), TEXT("CustomPinProperties"));
@@ -1999,31 +2047,56 @@ void inline LinkPoseInputPin(const FString& PinName, UAnimGraphNode_Base* Node, 
 			: TEXT("what feeds it hands nothing out"));
 }
 
+/* Or the value itself, where it was cooked with its enum's name on it */
+	if (FString Spelled; Properties.IsValid() && Properties->TryGetStringField(TEXT("ActiveEnumValue"), Spelled)) {
+		FString EnumName;
+
+		if (Spelled.Split(TEXT("::"), &EnumName, nullptr)) {
+			if (UEnum* Found = FindEnumByType(EnumName)) return Found;
+		}
+	}
+
+	return nullptr;
+}
+
 void IAnimationBlueprintImporter::UpdateBlendListByEnumVisibleEntries(FUObjectExport* NodeExport, FUObjectExportContainer* Container, UEdGraph* AnimGraph) {
 	TSharedPtr<FJsonObject> NodeJsonObject = NodeExport->JsonObject;
 	UAnimGraphNode_BlendListByEnum* BlendListByEnum = Cast<UAnimGraphNode_BlendListByEnum>(NodeExport->Object);
-	
+
     if (!BlendListByEnum || !NodeJsonObject) {
         return;
     }
 
 	/* Get the BoundEnum set before in the BlendListByEnum node */
     const UEnum* BoundEnum = BlendListByEnum->GetEnum();
+
+	/* Not cooked. The class keeps the value the node switches on and nothing about the enum it is
+	 * of, so it is worked out from whatever hands the node that value: the variable drawn into the
+	 * pin, or the one bound to it, and the property on the far end of that is of an enum. */
+	if (!BoundEnum) {
+		if (UEnum* Inferred = InferBlendListEnum(BlendListByEnum, NodeJsonObject)) {
+			if (const FObjectProperty* Keeps = CastField<FObjectProperty>(BlendListByEnum->GetClass()->FindPropertyByName(TEXT("BoundEnum")))) {
+				Keeps->SetObjectPropertyValue_InContainer(BlendListByEnum, Inferred);
+			}
+
+			BoundEnum = BlendListByEnum->GetEnum();
+		}
+	}
+
     if (!BoundEnum) {
+		FImportIssues::Report(
+			EImportIssue::Data,
+			TEXT("A blend by enum with nothing to say which enum"),
+			FString::Printf(TEXT("'%s' switches %s on a value the class keeps as a plain byte, and nothing drawn or bound to it says which enum that is."), *GetAssetName(), *NodeExport->GetName().ToString())
+		);
+
         return;
     }
 
 	TArray<TSharedPtr<FJsonValue>> EnumToPoseIndexArray = NodeJsonObject->GetArrayField(TEXT("EnumToPoseIndex"));
 
-	/* Create VisibleEnumEntries array using the enum.
-	 *
-	 * In the order of the poses they choose, not the order of the enum. The compiler numbers each
-	 * entry's pose by where the entry stands in this list, so a list in enum order gives every
-	 * entry added out of order the pose of another: a blend somebody built as Back, Forward, Left
-	 * comes back choosing Forward's pose for Back. */
+	/* Create VisibleEnumEntries array using the enum */
 	TArray<FName> VisibleEnumEntries;
-
-	TArray<TPair<int32, FName>> ByPose;
 
     for (int32 i = 0; i < EnumToPoseIndexArray.Num(); i++) {
         const int32 Value = static_cast<int32>(EnumToPoseIndexArray[i]->AsNumber());
@@ -2035,32 +2108,26 @@ void IAnimationBlueprintImporter::UpdateBlendListByEnumVisibleEntries(FUObjectEx
                     EnumEntryName.Split("::", nullptr, &EnumEntryName);
                 }
 
-                ByPose.Add(TPair<int32, FName>(Value, FName(*EnumEntryName)));
+                VisibleEnumEntries.Add(FName(*EnumEntryName));
             }
         }
     }
 
-	ByPose.StableSort([](const TPair<int32, FName>& A, const TPair<int32, FName>& B) { return A.Key < B.Key; });
-
-	for (const TPair<int32, FName>& One : ByPose) {
-		VisibleEnumEntries.Add(One.Value);
-	}
-	
     if (const FArrayProperty* VisEnumArrayProp = FindFProperty<FArrayProperty>(BlendListByEnum->GetClass(), TEXT("VisibleEnumEntries"))) {
         const void* ArrayPtr = VisEnumArrayProp->ContainerPtrToValuePtr<void>(BlendListByEnum);
         FScriptArrayHelper ArrayHelper(VisEnumArrayProp, ArrayPtr);
-    	
+
         ArrayHelper.Resize(0);
-    	
+
         const FNameProperty* NameProp = CastField<FNameProperty>(VisEnumArrayProp->Inner);
         if (!NameProp) {
             return;
         }
-    	
+
         for (const FName& Entry : VisibleEnumEntries) {
             const int32 NewIdx = ArrayHelper.AddValue();
             void* ElemPtr = ArrayHelper.GetRawPtr(NewIdx);
-        	
+
             NameProp->SetPropertyValue(ElemPtr, Entry);
         }
     }
@@ -2075,32 +2142,34 @@ void IAnimationBlueprintImporter::UpdateBlendListByEnumVisibleEntries(FUObjectEx
 		const FString IndexedPinName = FString::Printf(TEXT("BlendPose_%d"), 0);
 
 		FUObjectExport* TargetNodeExport = Container->Find(LinkID);
-		UAnimGraphNode_Base* TargetNode = TargetNodeExport ? Cast<UAnimGraphNode_Base>(TargetNodeExport->Object) : nullptr;
+		UAnimGraphNode_Base* TargetNode = Cast<UAnimGraphNode_Base>(TargetNodeExport->Object);
 
 		LinkPoseInputPin(IndexedPinName, BlendListByEnum, TargetNode, AnimGraph);
 
 		BlendPoseIndex++;
 	}
 
-	/* Map poses corresponding to the bound enum. The entries are in pose order, so each pin past
-	 * the default takes the pose of the same number. */
-	for (const TPair<int32, FName>& One : ByPose) {
-		const int32 PoseIndex = One.Key;
+	/* Map poses corresponding to the bound enum */
+	for (int32 EnumIndex = 0; EnumIndex < BoundEnum->NumEnums() - 1; ++EnumIndex) {
+		if (EnumIndex < EnumToPoseIndexArray.Num()) {
+			const int PoseIndex = EnumToPoseIndexArray[EnumIndex]->AsNumber();
 
-		if (PoseIndex < BlendPoseArray.Num()) {
-			FString LinkID = BlendPoseArray[PoseIndex]->AsObject()->GetStringField(TEXT("LinkID"));
-			const FString IndexedPinName = FString::Printf(TEXT("BlendPose_%d"), BlendPoseIndex);
+			if (PoseIndex == 0) continue;
 
-			FUObjectExport* TargetNodeExport = Container->Find(LinkID);
-			UAnimGraphNode_Base* TargetNode = TargetNodeExport ? Cast<UAnimGraphNode_Base>(TargetNodeExport->Object) : nullptr;
+			if (PoseIndex < BlendPoseArray.Num()) {
+				FString LinkID = BlendPoseArray[PoseIndex]->AsObject()->GetStringField(TEXT("LinkID"));
+                const FString IndexedPinName = FString::Printf(TEXT("BlendPose_%d"), BlendPoseIndex);
 
-			LinkPoseInputPin(IndexedPinName, BlendListByEnum, TargetNode, AnimGraph);
+				FUObjectExport* TargetNodeExport = Container->Find(LinkID);
+				UAnimGraphNode_Base* TargetNode = Cast<UAnimGraphNode_Base>(TargetNodeExport->Object);
+
+				LinkPoseInputPin(IndexedPinName, BlendListByEnum, TargetNode, AnimGraph);
+			}
 		}
 
 		BlendPoseIndex++;
 	}
 }
-
 void IAnimationBlueprintImporter::CreateAnimGraphNodes(UEdGraph* AnimGraph, const TSharedPtr<FJsonObject>& AnimNodeProperties, FUObjectExportContainer& OutContainer) {
 	for (const auto& Pair : AnimNodeProperties->Values) {
 		FString Key = JsonKeyToString(Pair.Key);
@@ -2108,62 +2177,7 @@ void IAnimationBlueprintImporter::CreateAnimGraphNodes(UEdGraph* AnimGraph, cons
 		TSharedPtr<FJsonObject> Value = Pair.Value->AsObject();
 
 		/* Find the NodeType and GUID from the key */
-		FString NodeType, NodeStringGUID; {
-			Key.Split(TEXT("_"), &NodeType, &NodeStringGUID, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
-
-			/* Handle case for format: "AnimGraphNode[0]" */
-			if (Key.Contains("[")) {
-				FString CleanKey = Key.Left(Key.Find("["));
-				
-				TArray<FString> Parts; {
-					CleanKey.ParseIntoArray(Parts, TEXT("_"));
-				}
-				
-				NodeType = Parts.Num() >= 2 ? Parts[0] + TEXT("_") + Parts[1] : CleanKey;
-				NodeStringGUID.Empty();
-			}
-		}
-
-		/* An unnumbered key splits into its class prefix alone; game nodes prefix theirs too ("FortAnimGraphNode_BlendFacialCurves"). */
-		if (NodeType.EndsWith(TEXT("AnimGraphNode"))) {
-			NodeType = Key;
-		}
-
-		/* Redirections */
-		if (NodeType == "AnimGraphNode_SubInput") {
-			NodeType = "AnimGraphNode_LinkedInputPose";
-		}
-
-		/* Only add json object data, transition result is handled different */
-		if (NodeType == "AnimGraphNode_TransitionResult") {
-			OutContainer.Exports.Add(
-				new FUObjectExport(
-					FName(*Key),
-					FName(*NodeType),
-					StringToName(AnimGraph->GetName()),
-					Value,
-					nullptr,
-					nullptr
-				)
-			);
-
-			continue;
-		}
-
-		/* Parse the NodeGuid, if not parsed properly, generate a new one.
-		 *
-		 * UE4 named node properties after the node's guid ("AnimGraphNode_ApplyAdditive_10AB22C6...") so it
-		 * parses straight back out. UE5 numbers them instead ("AnimGraphNode_ModifyBone_3"), so the parse fails
-		 * for every node and FGuid() is all zeroes, not a fresh guid, so they would all end up sharing one.
-		 * FAnimBlueprintCompilerContext does NodeGuidToIndexMap.Add(Node->NodeGuid, Index) per node, and TMap::Add
-		 * overwrites on a duplicate key, so a whole graph of zeroes collapses to a single entry pointing at
-		 * whichever node compiled last. Everything that resolves a node through that map afterward state
-		 * machines, asset players, blend space graphs then reads the wrong index. */
-		FGuid NodeGuid; {
-			FGuid::Parse(NodeStringGUID, NodeGuid);
-
-			if (!NodeGuid.IsValid()) NodeGuid = FGuid::NewGuid();
-		}
+		const FString NodeType = NodeKindFromKey(Key);
 
 		const UClass* Class = FindClassByType(NodeType);
 
@@ -2528,6 +2542,14 @@ void IAnimationBlueprintImporter::HandleNodeDeserialization(FUObjectExportContai
 			Node->bCommentBubbleVisible = true;
 		}
 		
+				if (UAnimGraphNode_BlendListByEnum* BlendList = Cast<UAnimGraphNode_BlendListByEnum>(Node)) {
+			if (UEnum* Found = InferBlendListEnum(BlendList, NodeProperties)) {
+				BlendList->Node.BoundEnum = Found;
+			}
+		}
+
+		SettleLinkedGraph(Node, NodeProperties);
+
 		Node->AllocateDefaultPins();
 		Node->Modify();
 
@@ -2601,59 +2623,68 @@ void IAnimationBlueprintImporter::ConnectAnimGraphNodes(FUObjectExportContainer*
             UpdateBlendListByEnumVisibleEntries(Export, Container, AnimGraph);
         	continue;
         }
-    	
+
         for (const auto& Pair : Json->Values) {
             const FString Key = JsonKeyToString(Pair.Key);
             const TSharedPtr<FJsonValue>& Value = Pair.Value;
-            
+
             if (Value->Type == EJson::Array) {
                 const TArray<TSharedPtr<FJsonValue>>& JsonArray = Value->AsArray();
-                
+
                 for (int32 Index = 0; Index < JsonArray.Num(); ++Index) {
                     const TSharedPtr<FJsonValue>& Elem = JsonArray[Index];
-                    
+
                     if (!Elem.IsValid() || !Elem->AsObject().IsValid()) {
                         continue;
                     }
-                    
+
                     const TSharedPtr<FJsonObject>& Obj = Elem->AsObject();
                     if (!Obj->HasField(TEXT("LinkID"))) {
                         continue;
                     }
-                    
+
                     const FString LinkID = Obj->GetStringField(TEXT("LinkID"));
                     UAnimGraphNode_Base* TargetNode = Cast<UAnimGraphNode_Base>(Container->Find(LinkID)->Object);
-                    
+
                     if (!TargetNode) {
                         continue;
                     }
-                    
+
                     const FStructProperty* NodeProp = GetNodeStructProperty(Node);
                     if (!NodeProp) {
                         continue;
                     }
-                    
+
                     for (TFieldIterator<FProperty> It(NodeProp->Struct); It; ++It) {
                         FProperty* Property = *It;
-                        
+
                         if (Property->GetName() != JsonKeyToString(Pair.Key)) {
                             continue;
                         }
-                        
+
                         if (const FArrayProperty* ArrayProp = CastField<FArrayProperty>(Property)) {
                             const FStructProperty* InnerStruct = CastField<FStructProperty>(ArrayProp->Inner);
-                            
+
                             if (!InnerStruct || !InnerStruct->Struct->IsChildOf(FPoseLinkBase::StaticStruct())) {
                                 continue;
                             }
-                            
-                            const FString IndexedPinName = FString::Printf(TEXT("%s_%d"), *Pair.Key, Index);
+
+                            /* A linked graph's poses are pins named after the pose the graph takes
+                             * in, and the class lists those names beside the links */
+                            FString IndexedPinName = FString::Printf(TEXT("%s_%d"), *Pair.Key, Index);
+
+                            if (Key == TEXT("InputPoses") && Cast<UAnimGraphNode_LinkedAnimGraphBase>(Node) != nullptr) {
+                                if (const TArray<TSharedPtr<FJsonValue>>* Named = nullptr; Json->TryGetArrayField(TEXT("InputPoseNames"), Named) && Named->IsValidIndex(Index)) {
+                                    IndexedPinName = (*Named)[Index]->AsString();
+                                }
+                            }
+
                             LinkPoseInputPin(IndexedPinName, Node, TargetNode, AnimGraph);
                         }
                     }
                 }
             }
-            
+
             if (Value->Type == EJson::Object && Value->AsObject()->HasTypedField<EJson::String>(TEXT("LinkID"))) {
                 /* Borrowing a cached pose is not a pin being fed.
                  *
@@ -2673,27 +2704,26 @@ void IAnimationBlueprintImporter::ConnectAnimGraphNodes(FUObjectExportContainer*
 
                     continue;
                 }
-                
+
                 const FStructProperty* NodeProp = GetNodeStructProperty(Node);
 
                 if (!NodeProp) {
                     continue;
                 }
-                
+
                 for (TFieldIterator<FProperty> It(NodeProp->Struct); It; ++It) {
                     const FProperty* Property = *It;
-                    
+
                     if (Property->GetName() != JsonKeyToString(Pair.Key)) {
                         continue;
                     }
-                    
+
                     LinkPoseInputPin(Key, Node, TargetNode, AnimGraph);
                 }
             }
         }
     }
 }
-
 /* In newer versions of Unreal Engine, EvaluateGraphExposedInputs was moved to the main AnimBlueprintGeneratedClass class */
 /* Here, we move them into the node data to use more easily */
 void IAnimationBlueprintImporter::ProcessEvaluateGraphExposedInputs(const TSharedPtr<FJsonObject>& AnimNodeProperties) const {
@@ -2825,6 +2855,18 @@ void IAnimationBlueprintImporter::SettleCachedPoses() {
 			);
 
 			continue;
+		}
+
+				/* A saver with nothing feeding it is one the compiler treats as deleted: it goes looking
+		 * for another of the same name in the source graphs and finds the very node it is
+		 * cloning, which is then in no allocated list ("Failed to find index for a saved pose
+		 * node"). Said here, where the pose and its saver can both be named. */
+		if (Saved->Pins.Num() > 0 && Saved->Pins[0] != nullptr && Saved->Pins[0]->LinkedTo.Num() == 0) {
+			FImportIssues::Report(
+				EImportIssue::Data,
+				TEXT("A saved pose that nothing feeds"),
+				FString::Printf(TEXT("'%s' saves \"%s\" in %s, and nothing is wired into it; \"%s\" borrows it."), *GetAssetName(), *Saved->CacheName, *Saved->GetGraph()->GetName(), *Borrowing->GetName())
+			);
 		}
 
 		Borrowing->SaveCachedPoseNode = Saved;
@@ -3038,4 +3080,426 @@ UEdGraph* IAnimationBlueprintImporter::FindAnimGraph(UAnimBlueprint* AnimBluepri
 	}
 	
 	return nullptr;
+}
+
+/* Which kind of node a class property is, read off its name.
+ *
+ * The class names each node's property after the editor node that made it, with a number on the
+ * end where two are the same kind ("AnimGraphNode_ModifyBone_3") or nothing where one is on its
+ * own ("AnimGraphNode_BlendListByEnum"). The kind is whatever is left once the number is taken
+ * off. What is left is not always a class this engine has: a game's own nodes are prefixed with
+ * the game's name rather than "AnimGraphNode", and a node made before its class was renamed keeps
+ * the old name on its property. */
+FString IAnimationBlueprintImporter::NodeKindFromKey(const FString& Key) {
+	FString Kind, Rest;
+
+	if (!Key.Split(TEXT("_"), &Kind, &Rest, ESearchCase::IgnoreCase, ESearchDir::FromEnd)) {
+		Kind = Key;
+	}
+
+	/* Handle case for format: "AnimGraphNode[0]" */
+	if (Key.Contains(TEXT("["))) {
+		const FString CleanKey = Key.Left(Key.Find(TEXT("[")));
+
+		TArray<FString> Parts;
+		CleanKey.ParseIntoArray(Parts, TEXT("_"));
+
+		Kind = Parts.Num() >= 2 ? Parts[0] + TEXT("_") + Parts[1] : CleanKey;
+		Rest.Empty();
+	}
+
+	/* Nothing numbered it, so the whole name is the kind: "AnimGraphNode_BlendListByEnum", or a
+	 * game's "FortAnimGraphNode_ScaleCharacterBones". A guid on the end (4.x named nodes that way)
+	 * is hex and not a number either, and then the class is only ever found under the front. */
+	if (Rest.IsEmpty() || !Rest.IsNumeric()) {
+		if (Kind == TEXT("AnimGraphNode") || Kind.IsEmpty() || FindClassByType(Key) != nullptr) {
+			Kind = Key;
+		}
+	}
+
+	/* Redirections: classes the engine renamed under the nodes already made from them */
+	static const TMap<FString, FString> Renamed = {
+		{ TEXT("AnimGraphNode_SubInput"), TEXT("AnimGraphNode_LinkedInputPose") },
+		{ TEXT("AnimGraphNode_SubInstance"), TEXT("AnimGraphNode_LinkedAnimGraph") },
+		{ TEXT("AnimGraphNode_Layer"), TEXT("AnimGraphNode_LinkedAnimLayer") },
+	};
+
+	if (const FString* Now = Renamed.Find(Kind)) {
+		Kind = *Now;
+	}
+
+	return Kind;
+}
+
+/* Whether the class declares a layer of its own by this name: a blueprint event that hands back a
+ * pose under the layer's name. An interface's layer is implemented rather than declared, and has no
+ * event flag; the animation graph itself is not a layer. */
+bool IAnimationBlueprintImporter::IsSelfLayerFunction(const FString& Named) const {
+	if (Named.IsEmpty() || Named == UEdGraphSchema_K2::GN_AnimGraph.ToString() || GetContainer() == nullptr) return false;
+
+	for (const FUObjectExport* Export : GetContainer()->Exports) {
+		if (Export == nullptr || !Export->IsJsonValid() || Export->GetType() != TEXT("Function") || Export->GetName().ToString() != Named) continue;
+
+		FString Flags;
+
+		if (!Export->JsonObject->TryGetStringField(TEXT("FunctionFlags"), Flags) || !Flags.Contains(TEXT("FUNC_BlueprintEvent"))) return false;
+
+		const TArray<TSharedPtr<FJsonValue>>* Children = nullptr;
+
+		if (!Export->JsonObject->TryGetArrayField(TEXT("ChildProperties"), Children)) return false;
+
+		for (const TSharedPtr<FJsonValue>& Child : *Children) {
+			const TSharedPtr<FJsonObject> Property = Child.IsValid() ? Child->AsObject() : nullptr;
+
+			if (!Property.IsValid()) continue;
+
+			FString PropertyFlags, PropertyName, StructName;
+
+			Property->TryGetStringField(TEXT("PropertyFlags"), PropertyFlags);
+			Property->TryGetStringField(TEXT("Name"), PropertyName);
+
+			if (const TSharedPtr<FJsonObject>* Struct = nullptr; Property->TryGetObjectField(TEXT("Struct"), Struct)) {
+				(*Struct)->TryGetStringField(TEXT("ObjectName"), StructName);
+			}
+
+			if (PropertyName == Named && PropertyFlags.Contains(TEXT("OutParm")) && StructName.Contains(TEXT("PoseLink"))) return true;
+		}
+
+		return false;
+	}
+
+	return false;
+}
+
+void IAnimationBlueprintImporter::SettleLinkedGraph(UAnimGraphNode_Base* Node, const TSharedPtr<FJsonObject>& Properties) {
+	UAnimGraphNode_LinkedAnimGraphBase* Linked = Cast<UAnimGraphNode_LinkedAnimGraphBase>(Node);
+
+	if (Linked == nullptr) return;
+
+	const FStructProperty* Inside = GetNodeStructProperty(Linked);
+
+	if (Inside == nullptr || Inside->Struct == nullptr) return;
+
+	const bool bLayer = Linked->IsA<UAnimGraphNode_LinkedAnimLayer>();
+
+	FProperty* Structural = Inside->Struct->FindPropertyByName(bLayer ? TEXT("Layer") : TEXT("InstanceClass"));
+
+	if (Structural == nullptr) return;
+
+	FPropertyChangedEvent Changed(Structural);
+
+	Linked->PostEditChangeProperty(Changed);
+
+	/* And the guid of the interface graph the layer conforms to, which the compiler matches the
+	 * node to the graph by. Set the way the node sets it for itself, since that is not exported. */
+	UAnimGraphNode_LinkedAnimLayer* Layer = Cast<UAnimGraphNode_LinkedAnimLayer>(Linked);
+	UAnimBlueprint* Owning = Layer != nullptr ? Cast<UAnimBlueprint>(Layer->GetBlueprint()) : nullptr;
+
+	/* The function reference the way the editor writes it when somebody picks the layer: a layer
+	 * of the blueprint's own refers to self, one of an interface refers to the interface. Announced
+	 * as a changed property it is written against the blueprint's own skeleton class instead, which
+	 * resolves but is not what the editor would have left. */
+	if (Layer != nullptr && !Layer->Node.Layer.IsNone()) {
+		if (const FStructProperty* Keeps = FindFProperty<FStructProperty>(UAnimGraphNode_LinkedAnimGraphBase::StaticClass(), TEXT("FunctionReference"))) {
+			FMemberReference& Reference = *Keeps->ContainerPtrToValuePtr<FMemberReference>(Layer);
+
+			if (UClass* TargetClass = Layer->GetTargetClass()) {
+				FGuid FunctionGuid;
+				FBlueprintEditorUtils::GetFunctionGuidFromClassByFieldName(FBlueprintEditorUtils::GetMostUpToDateClass(TargetClass), Layer->Node.Layer, FunctionGuid);
+				Reference.SetExternalMember(Layer->Node.Layer, TargetClass, FunctionGuid);
+			} else {
+				Reference.SetSelfMember(Layer->Node.Layer);
+			}
+		}
+	}
+
+	if (Layer != nullptr && Owning != nullptr) {
+		FGuid Conforms;
+
+		for (const FBPInterfaceDescription& Implemented : Owning->ImplementedInterfaces) {
+			for (const UEdGraph* InterfaceGraph : Implemented.Graphs) {
+				if (InterfaceGraph != nullptr && InterfaceGraph->GetFName() == Layer->Node.Layer) {
+					Conforms = InterfaceGraph->InterfaceGuid;
+				}
+			}
+		}
+
+		if (const FStructProperty* Keeps = FindFProperty<FStructProperty>(Layer->GetClass(), TEXT("InterfaceGuid")); Keeps != nullptr && Conforms.IsValid()) {
+			*Keeps->ContainerPtrToValuePtr<FGuid>(Layer) = Conforms;
+		}
+	}
+
+	/* The poses it takes, where the function it runs could not be resolved to draw them from.
+	 *
+	 * A linked graph whose class is not here yet, or a layer whose function did not resolve, comes
+	 * back with no pose pins at all, and everything wired into it is lost. The class lists the
+	 * poses by name beside the links, and a pin of that name is what the function would have made:
+	 * the compiler checks them against the function once it is there. */
+	TArray<FString> Has;
+
+	for (const UEdGraphPin* Pin : Linked->Pins) {
+		if (Pin != nullptr && Pin->Direction == EGPD_Input && UAnimationGraphSchema::IsPosePin(Pin->PinType)) Has.Add(Pin->PinName.ToString());
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* Named = nullptr;
+
+	if (Has.Num() == 0 && Properties.IsValid() && Properties->TryGetArrayField(TEXT("InputPoseNames"), Named)) {
+		for (const TSharedPtr<FJsonValue>& One : *Named) {
+			if (!One.IsValid() || One->AsString().IsEmpty()) continue;
+
+			UEdGraphPin* Pin = Linked->CreatePin(EGPD_Input, UAnimationGraphSchema::MakeLocalSpacePosePin(), FName(*One->AsString()));
+
+			if (Pin != nullptr) {
+				Pin->PinFriendlyName = FText::FromString(One->AsString());
+
+				Has.Add(One->AsString());
+			}
+		}
+
+		if (Has.Num() > 0) {
+			UE_LOG(LogReflection, Display, TEXT("\"%s\" resolved no function to draw its poses from, so its %d pose pin(s) were drawn from the names the class kept"), *Linked->GetName(), Has.Num());
+		}
+	}
+
+	UE_LOG(LogReflection, Verbose, TEXT("\"%s\" settled: layer %s, target %s, pose pins [%s]"),
+		*Linked->GetName(),
+		Layer != nullptr ? *Layer->Node.Layer.ToString() : TEXT("-"),
+		Linked->GetTargetClass() != nullptr ? *Linked->GetTargetClass()->GetName() : TEXT("none"),
+		*FString::Join(Has, TEXT(" ")));
+}
+
+/* The enum behind a property reached by a path through the class, or null where there is none */
+static UEnum* EnumAtPath(const UStruct* From, const TArray<FString>& Path) {
+	const FProperty* Property = nullptr;
+
+	for (const FString& Step : Path) {
+		if (From == nullptr) return nullptr;
+
+		Property = From->FindPropertyByName(FName(*Step));
+
+		if (Property == nullptr) return nullptr;
+
+		if (const FStructProperty* Held = CastField<FStructProperty>(Property)) {
+			From = Held->Struct;
+		} else if (const FObjectPropertyBase* Points = CastField<FObjectPropertyBase>(Property)) {
+			From = Points->PropertyClass;
+		} else {
+			From = nullptr;
+		}
+	}
+
+	if (const FEnumProperty* Enumerated = CastField<FEnumProperty>(Property)) return Enumerated->GetEnum();
+	if (const FByteProperty* Byte = CastField<FByteProperty>(Property)) return Byte->Enum;
+
+	return nullptr;
+}
+
+UEnum* IAnimationBlueprintImporter::InferBlendListEnum(UAnimGraphNode_BlendListByEnum* Node, const TSharedPtr<FJsonObject>& Properties) const {
+	if (Node == nullptr || AnimBlueprint == nullptr) return nullptr;
+
+	const UStruct* Owner = AnimBlueprint->SkeletonGeneratedClass != nullptr ? static_cast<const UStruct*>(AnimBlueprint->SkeletonGeneratedClass.Get()) : static_cast<const UStruct*>(AnimBlueprint->ParentClass.Get());
+
+	/* Whatever is wired into the pin says what it carries */
+	if (const UEdGraphPin* Pin = Node->FindPin(TEXT("ActiveEnumValue"), EGPD_Input)) {
+		for (const UEdGraphPin* Feeds : Pin->LinkedTo) {
+			if (Feeds == nullptr) continue;
+
+			if (UEnum* Says = Cast<UEnum>(Feeds->PinType.PinSubCategoryObject.Get())) return Says;
+
+			if (const UK2Node_VariableGet* Reads = Cast<UK2Node_VariableGet>(Feeds->GetOwningNode())) {
+				if (UEnum* Says = EnumAtPath(Owner, { Reads->GetVarNameString() })) return Says;
+			}
+		}
+	}
+
+	/* Or whatever is bound to it */
+	for (const FUObjectExportContainer* Container : AnimNodeContainers) {
+		if (Container == nullptr) continue;
+
+		for (const FUObjectExport* Export : Container->Exports) {
+			if (Export == nullptr || Export->Object != Node) continue;
+
+			if (const TArray<FHandedOver>* Says = Bindings.Find(Export->GetName().ToString())) {
+				for (const FHandedOver& One : *Says) {
+					if (One.Member != TEXT("ActiveEnumValue")) continue;
+
+					if (UEnum* Found = EnumAtPath(Owner, One.Path)) return Found;
+				}
+			}
+		}
+	}
+
+	/* Or the value itself, where it was cooked with its enum's name on it */
+	if (FString Spelled; Properties.IsValid() && Properties->TryGetStringField(TEXT("ActiveEnumValue"), Spelled)) {
+		FString EnumName;
+
+		if (Spelled.Split(TEXT("::"), &EnumName, nullptr)) {
+			if (UEnum* Found = FindEnumByType(EnumName)) return Found;
+		}
+	}
+
+	return nullptr;
+}
+
+/* A node's tag, which is what links a graph into it at run time.
+ *
+ * A linked anim graph with no class of its own is linked one by tag from code (LinkAnimGraphByTag),
+ * and the tag is kept on nothing but the class: its tag subsystem lists each tag against the index
+ * of the node that carries it, in the same order the class lists its saved poses and asset players.
+ * Read back without it every such node has no tag, nothing in code can find it, and the graph it
+ * was meant to run is never linked: the node stays empty and hands back the reference pose. */
+void IAnimationBlueprintImporter::TagNodes() {
+	if (!SerializedSparseClassData.IsValid()) return;
+
+	const TSharedPtr<FJsonObject>* Subsystem = nullptr;
+
+	if (!SerializedSparseClassData->TryGetObjectField(TEXT("AnimBlueprintExtension_Tag"), Subsystem) || !Subsystem->IsValid()) return;
+
+	const TArray<TSharedPtr<FJsonValue>>* Listed = nullptr;
+
+	if (!(*Subsystem)->TryGetArrayField(TEXT("NodeIndices"), Listed)) return;
+
+	int32 Put = 0;
+
+	for (const TSharedPtr<FJsonValue>& Entry : *Listed) {
+		const TSharedPtr<FJsonObject>* Pair = nullptr;
+
+		if (!Entry.IsValid() || !Entry->TryGetObject(Pair) || !Pair->IsValid()) continue;
+
+		FString Tag;
+		int32 Index = INDEX_NONE;
+
+		if (!(*Pair)->TryGetStringField(TEXT("Key"), Tag) || !(*Pair)->TryGetNumberField(TEXT("Value"), Index) || Tag.IsEmpty()) continue;
+
+		if (!ReversedNodesKeys.IsValidIndex(Index)) {
+			UE_LOG(LogReflection, Warning, TEXT("tag \"%s\" names node %d, and the class has only %d"), *Tag, Index, ReversedNodesKeys.Num());
+
+			continue;
+		}
+
+		const FString& Key = ReversedNodesKeys[Index];
+		UAnimGraphNode_Base* Node = nullptr;
+
+		for (FUObjectExportContainer* Container : AnimNodeContainers) {
+			if (Container == nullptr) continue;
+
+			if (const FUObjectExport* Found = Container->Find(FName(*Key)); Found != nullptr && Found->Object != nullptr) {
+				Node = Cast<UAnimGraphNode_Base>(Found->Object);
+
+				if (Node != nullptr) break;
+			}
+		}
+
+		if (Node == nullptr || !IsValid(Node)) {
+			UE_LOG(LogReflection, Warning, TEXT("tag \"%s\" names \"%s\", which is standing in no graph"), *Tag, *Key);
+
+			continue;
+		}
+
+		Node->SetTag(FName(*Tag));
+		Put++;
+
+		UE_LOG(LogReflection, Display, TEXT("\"%s\" is tagged \"%s\""), *Key, *Tag);
+	}
+
+	UE_LOG(LogReflection, Display, TEXT("%d node tag(s) put back of the class's %d"), Put, Listed->Num());
+}
+
+void IAnimationBlueprintImporter::AuditNodes() {
+	/* Every node the class had, against every node now standing in a graph of the blueprint.
+	 *
+	 * A node can be made and then lost in any number of ways: a graph emptied under it, an output
+	 * pose taken out as one too many, a kind this build has no node for. None of that is a compile
+	 * error, and a graph short of a node is a graph that runs and does the wrong thing. So the two
+	 * lists are held against each other once everything is laid out, and the difference is said. */
+	TArray<UEdGraph*> Graphs;
+	AnimBlueprint->GetAllGraphs(Graphs);
+
+	TSet<UEdGraph*> Held(Graphs);
+
+	TMap<FString, TArray<FString>> Lost;
+	int32 Standing = 0;
+
+	for (const FString& Key : NodesKeys) {
+		const FUObjectExport* Export = nullptr;
+
+		for (FUObjectExportContainer* Container : AnimNodeContainers) {
+			if (Container == nullptr) continue;
+
+			if (const FUObjectExport* Found = Container->Find(FName(*Key)); Found != nullptr && Found->IsJsonValid()) {
+				Export = Found;
+
+				if (Found->Object != nullptr) break;
+			}
+		}
+
+		const UEdGraphNode* Node = Export != nullptr ? Cast<UEdGraphNode>(Export->Object) : nullptr;
+
+		if (Node != nullptr && IsValid(Node) && Node->GetGraph() != nullptr && Held.Contains(Node->GetGraph())) {
+			Standing++;
+
+			continue;
+		}
+
+		/* Grouped by kind, which is the key with its number taken off */
+		FString Kind = Key;
+
+		if (int32 At; Kind.FindLastChar(TEXT('_'), At) && Kind.RightChop(At + 1).IsNumeric()) Kind.LeftInline(At);
+
+		Lost.FindOrAdd(Kind).Add(Export == nullptr ? Key : Node == nullptr ? Key + TEXT(" (never made)") : Key + TEXT(" (in no graph)"));
+	}
+
+	UE_LOG(LogReflection, Display, TEXT("\"%s\": %d of the class's %d node(s) are standing in a graph"), *GetAssetName(), Standing, NodesKeys.Num());
+
+	/* And every output pose with nothing wired into it, which the compiler only notes ("Result was
+	 * visible but ignored") and a graph so left answers with the reference pose.
+	 *
+	 * That holds for the main graph only. An interface has nothing to wire by definition, and a
+	 * layer graph left empty is how a blueprint declines a layer: the class marks the function
+	 * bImplemented = false (UAnimBlueprintGeneratedClass::Link) and the linked layer node keeps its
+	 * default, so those are the shape of a correct import and are only logged. */
+	TArray<FString> Unfed;
+	TArray<FString> Declined;
+
+	if (AnimBlueprint->BlueprintType != BPTYPE_Interface) {
+		for (UEdGraph* Graph : Graphs) {
+			if (Graph == nullptr) continue;
+
+			for (UEdGraphNode* Node : Graph->Nodes) {
+				const UAnimGraphNode_Root* Root = Cast<UAnimGraphNode_Root>(Node);
+
+				if (Root == nullptr) continue;
+
+				const UEdGraphPin* Result = Root->FindPin(TEXT("Result"), EGPD_Input);
+
+				if (Result != nullptr && Result->LinkedTo.Num() == 0) {
+					(Graph->GetFName() == UEdGraphSchema_K2::GN_AnimGraph ? Unfed : Declined).Add(FString::Printf(TEXT("%s (%s in %s)"), *Graph->GetName(), *Root->GetName(), Graph->GetOuter() != nullptr ? *Graph->GetOuter()->GetName() : TEXT("nothing")));
+				}
+			}
+		}
+	}
+
+	if (Declined.Num() > 0) {
+		UE_LOG(LogReflection, Display, TEXT("\"%s\": %d layer graph(s) are left unimplemented: %s"), *GetAssetName(), Declined.Num(), *FString::Join(Declined, TEXT(", ")));
+	}
+
+	if (Unfed.Num() > 0) {
+		UE_LOG(LogReflection, Warning, TEXT("\"%s\": %d output pose(s) have nothing wired into them: %s"), *GetAssetName(), Unfed.Num(), *FString::Join(Unfed, TEXT(", ")));
+
+		FImportIssues::Report(
+			EImportIssue::Data,
+			FString::Printf(TEXT("%d output pose(s) with nothing wired into them"), Unfed.Num()),
+			FString::Printf(TEXT("'%s': %s"), *GetAssetName(), *FString::Join(Unfed, TEXT(", ")))
+		);
+	}
+
+	for (const TPair<FString, TArray<FString>>& One : Lost) {
+		UE_LOG(LogReflection, Warning, TEXT("\"%s\": %d %s node(s) are in no graph: %s"), *GetAssetName(), One.Value.Num(), *One.Key, *FString::Join(One.Value, TEXT(", ")));
+
+		FImportIssues::Report(
+			EImportIssue::Data,
+			FString::Printf(TEXT("%d %s node(s) of the class are in no graph"), One.Value.Num(), *One.Key),
+			FString::Printf(TEXT("'%s' laid out %d of %d nodes. Missing: %s"), *GetAssetName(), Standing, NodesKeys.Num(), *FString::Join(One.Value, TEXT(", ")))
+		);
+	}
 }

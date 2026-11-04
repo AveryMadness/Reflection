@@ -69,6 +69,7 @@ public:
 	static inline FString FontFaceURL = TEXT("/api/export/fontface");
 	static inline FString DnaPosesURL = TEXT("/api/export/dnaposes");
 	static inline FString DnaMorphsURL = TEXT("/api/export/dnamorphs");
+	static inline FString DiagnoseMeshURL = TEXT("/api/diagnose/mesh");
 	static inline FString CurveMappingURL = TEXT("/api/export/curvemapping");
 
 	class REFLECTION_API Export {
@@ -92,23 +93,33 @@ public:
 		 * they live in the LOD's cooked override tables. Empty for anything without them. */
 		static TArray<TSharedPtr<FJsonValue>> GetSkinWeightsBlocking(const FString& Path);
 
-		/* The cooked geometry, vertex for vertex. Null when the Cloud has no mesh at Path. */
-		static TSharedPtr<FJsonObject> GetLodModelBlocking(const FString& Path);
+		/* The cooked geometry, vertex for vertex. Null when the Cloud has no mesh at Path, and
+		 * OutFailure then carries what the Cloud said about it, where it said anything. */
+		static TSharedPtr<FJsonObject> GetLodModelBlocking(const FString& Path, FString* OutFailure = nullptr);
 
 		/* The cooked morph deltas, keyed to the same vertices the LOD model serves */
 		static TSharedPtr<FJsonObject> GetMorphTargetsBlocking(const FString& Path);
 
-		/* The cooked static mesh geometry and its slots. Null when the Cloud has none at Path. */
+		/* The cooked static mesh geometry and its slots. Null when the Cloud has none at Path,
+		 * and OutFailure then carries what the Cloud said about it, where it said anything. */
 		/* Named where the package holds more than one mesh, since the Cloud answers with the
 		 * first it finds otherwise, and an HLOD proxy keeps a mesh per thing it stands in for */
-		static TSharedPtr<FJsonObject> GetStaticMeshBlocking(const FString& Path, const FString& Named = FString());
+		static TSharedPtr<FJsonObject> GetStaticMeshBlocking(const FString& Path, const FString& Named = FString(), FString* OutFailure = nullptr);
+		static TSharedPtr<FJsonObject> GetStaticMeshBlocking(const FString& Path, FString* OutFailure) { return GetStaticMeshBlocking(Path, FString(), OutFailure); }
+
+		/* Why the Cloud serves, or does not serve, the mesh at Path: the build the profile reads
+		 * as, the file and its payloads, the package's versions and flags, every LOD's buffers,
+		 * and what the reader logged on the way. Written out whole beside the project's logs,
+		 * and the verdict lines logged here. Returns the file it wrote, or nothing when the Cloud
+		 * did not answer. */
+		static FString DiagnoseMeshBlocking(const FString& Path, const FString& AssetName);
 
 		/* A MetaHuman head's DNA, as the bytes RigLogic reads. Empty for a mesh without one. */
 		static TArray<uint8> GetDnaBlocking(const FString& Path);
 
 		/* The pose the mesh itself is bound at, which is not the one its skeleton carries. Null
 		 * when the Cloud has no mesh at Path. */
-		static TSharedPtr<FJsonObject> GetReferenceSkeletonBlocking(const FString& Path);
+		static TSharedPtr<FJsonObject> GetReferenceSkeletonBlocking(const FString& Path, FString* OutFailure = nullptr);
 
 		/* The arithmetic a curve expression asset drives its curves with, which cooking leaves
 		 * only as compiled instructions */

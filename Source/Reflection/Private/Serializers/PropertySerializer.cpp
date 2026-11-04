@@ -693,6 +693,13 @@ void UPropertySerializer::DeserializePropertyValue(FProperty* Property, const TS
 
 			if (!Object) Importer->LoadExport(&JsonValueAsObject, Object);
 
+			/* A same-named asset beside the package (a widget called after its own blueprint) is not the object meant */
+			if (const FObjectPropertyBase* BaseObjProp = CastField<const FObjectPropertyBase>(ObjectProperty)) {
+				if (Object && BaseObjProp->PropertyClass && !Object->IsA(BaseObjProp->PropertyClass)) {
+					Object = nullptr;
+				}
+			}
+
 			/* Taken apart while that ran, so the rest of this is written nowhere */
 			if (Into != nullptr && !Filling.IsValid()) {
 				UE_LOG(LogReflectionPropertySerializer, Warning, TEXT("\"%s\" was being read into something an import took apart, and was left"),
@@ -1067,8 +1074,25 @@ void UPropertySerializer::DeserializePropertyValue(FProperty* Property, const TS
 		if (JsonValue->Type == EJson::String) {
 			FString EnumAsString = JsonValue->AsString();
 
-			if (!ByteProperty->Enum)
-			{
+			/* A byte the game typed with an enum this engine keeps as a plain number: the string is
+			 * \"EType::Value\", and the enum still exists to be looked up by that name */
+			if (ByteProperty->Enum == nullptr) {
+				FString EnumTypeName, EnumValueName;
+				const UEnum* Typed = EnumAsString.Split(TEXT("::"), &EnumTypeName, &EnumValueName) ? FindFirstObject<UEnum>(*EnumTypeName, EFindFirstObjectOptions::NativeFirst) : nullptr;
+				int64 Untyped = Typed != nullptr ? Typed->GetValueByNameString(EnumAsString) : -1;
+
+				if (Untyped == -1 && EnumAsString.IsNumeric()) {
+					Untyped = FCString::Atoi64(*EnumAsString);
+				}
+
+				if (Untyped == -1) {
+					UE_LOG(LogReflection, Warning, TEXT("'%s' on %s is a plain byte here, and \"%s\" is not a number or an enum this engine has: left at 0"), *Property->GetName(), *Property->GetOwnerVariant().GetName(), *EnumAsString);
+
+					Untyped = 0;
+				}
+
+				ByteProperty->SetIntPropertyValue(OutValue, Untyped);
+
 				return;
 			}
 			

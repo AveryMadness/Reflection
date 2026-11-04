@@ -48,6 +48,21 @@ UClass* FUObjectExport::GetClass() {
 	}
 
 	UClass* OutClass = FindClassByType(ClassName);
+
+	/* A blueprint class lives in a package that need not be loaded yet */
+	for (FString Path : { ClassName, GetString("Class") }) {
+		if (OutClass) break;
+
+		if (Path.Contains("'")) {
+			Path.Split("'", nullptr, &Path);
+			Path.Split("'", &Path, nullptr);
+		}
+
+		if (Path.StartsWith(TEXT("/")) && !Path.StartsWith(TEXT("/Script/"))) {
+			OutClass = LoadObject<UClass>(nullptr, *Path, nullptr, LOAD_NoWarn | LOAD_Quiet);
+		}
+	}
+
 	if (!OutClass) {
 		OutClass = FindClassByType(GetType().ToString());
 	}
@@ -93,9 +108,30 @@ UClass* FUObjectExport::GetClass() {
 
 	/* Kept only where it answers to something. A parent that cannot be found leaves the class it
 	 * was read as, which is a better guess than nothing at all. */
+	/* Kept only where it answers to something. A parent that cannot be found leaves the class it
+	 * was read as, which is a better guess than nothing at all. */
+	if (!Comes.IsValid() && OutClass != nullptr && OutClass->IsChildOf(UStruct::StaticClass())) {
+		/* Nothing says where it comes from, and what it was read as is a class of classes: the
+		 * keys it does carry are listed so the shape it arrived in can be seen */
+		FString Keys;
+
+		for (const auto& Pair : JsonObject->Values) {
+			Keys += (Keys.IsEmpty() ? TEXT("") : TEXT(", ")) + Pair.Key;
+		}
+
+		UE_LOG(LogReflection, Error, TEXT("\"%s\" is read as a %s and says nothing about where it comes from; it carries: %s"), *GetName().ToString(), *OutClass->GetName(), *Keys);
+	}
+
 	if (Comes.IsValid()) {
 		if (UClass* ParentClass = LoadClass(Comes)) {
 			OutClass = ParentClass;
+		} else {
+			/* Said out loud: what is left is the class the export was read as, and for a blueprint
+			 * that is BlueprintGeneratedClass itself, which nothing downstream survives */
+			UE_LOG(LogReflection, Error, TEXT("\"%s\" says it comes from \"%s\", which could not be found; left as a %s"),
+				*GetName().ToString(),
+				*Comes->GetStringField(TEXT("ObjectName")),
+				OutClass != nullptr ? *OutClass->GetName() : TEXT("nothing"));
 		}
 	}
 

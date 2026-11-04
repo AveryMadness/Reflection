@@ -212,7 +212,9 @@ inline void CreateStateMachineGraph(
 					 * which is false, and the compiler says as much: the conduit will never be
 					 * taken. Most of them are a plain yes, and a yes is a value on the node rather
 					 * than anything drawn, which is why there was nothing to notice missing. */
-					if (const FUObjectExport* Rule = RootContainer->Find(DelegateExportName); Rule != nullptr && Rule->IsJsonValid()) {
+					if (FUObjectExport* Rule = RootContainer->Find(DelegateExportName); Rule != nullptr && Rule->IsJsonValid()) {
+						/* The engine made the node when it made the conduit; the class's entry stands for it from here */
+						Rule->Object = ResultNode;
 						if (bool bEnters; Rule->JsonObject->TryGetBoolField(TEXT("bCanEnterTransition"), bEnters)) {
 							ResultNode->Node.bCanEnterTransition = bEnters;
 

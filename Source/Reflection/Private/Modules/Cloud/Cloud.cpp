@@ -6,6 +6,8 @@
 #include "HttpModule.h"
 #include "HttpManager.h"
 #include "TimerManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "GenericPlatform/GenericPlatformHttp.h"
 #include "Settings/Runtime.h"
 #include "Engine/Log.h"
@@ -195,14 +197,107 @@ TArray<TSharedPtr<FJsonValue>> Cloud::Export::GetSkinWeightsBlocking(const FStri
 	return Response->GetArrayField(TEXT("profiles"));
 }
 
-TSharedPtr<FJsonObject> Cloud::Export::GetLodModelBlocking(const FString& Path) {
-	const TSharedPtr<FJsonObject> Response = Cloud::GetBlocking(LodModelURL, { { TEXT("path"), Path } }, {});
+/* One shape for the three geometry endpoints: the payload where the Cloud served one, and
+ * otherwise what it said instead, logged and handed back for the import issue */
+static TSharedPtr<FJsonObject> GetGeometryBlocking(const FString& URL, const FString& What, const FString& Path, const TCHAR* PayloadField, const TMap<FString, FString>& Parameters, FString* OutFailure) {
+	int32 Status = 0;
+	const TSharedPtr<FJsonObject> Response = Cloud::GetBlockingWithStatus(URL, Parameters, {}, Status);
 
-	if (!Response.IsValid() || !Response->HasField(TEXT("lods"))) {
-		return nullptr;
+	if (Response.IsValid() && Status == 200 && Response->HasField(PayloadField)) {
+		return Response;
 	}
 
-	return Response;
+	FString Failure = Cloud::DescribeRefusal(Response, Status);
+
+	/* Answered, and with the right shape missing: the Cloud served something else for the path */
+	if (Response.IsValid() && Status == 200) {
+		Failure = FString::Printf(TEXT("the Cloud answered without \"%s\""), PayloadField);
+	}
+
+	UE_LOG(LogReflection, Error, TEXT("No %s for \"%s\": %s"), *What, *Path, *Failure);
+
+	if (OutFailure != nullptr) {
+		*OutFailure = Failure;
+	}
+
+	return nullptr;
+}
+
+TSharedPtr<FJsonObject> Cloud::Export::GetLodModelBlocking(const FString& Path, FString* OutFailure) {
+	return GetGeometryBlocking(LodModelURL, TEXT("skeletal mesh geometry"), Path, TEXT("lods"), { { TEXT("path"), Path } }, OutFailure);
+}
+
+FString Cloud::Export::DiagnoseMeshBlocking(const FString& Path, const FString& AssetName) {
+	int32 Status = 0;
+	const TSharedPtr<FJsonObject> Report = Cloud::GetBlockingWithStatus(DiagnoseMeshURL, { { TEXT("path"), Path } }, {}, Status);
+
+	if (!Report.IsValid()) {
+		UE_LOG(LogReflection, Warning, TEXT("The Cloud gave no diagnosis for \"%s\": %s"), *Path, *Cloud::DescribeRefusal(Report, Status));
+
+		return FString();
+	}
+
+	/* The verdict is the short form; the whole report goes to disk beside the logs, where it can
+	 * be read or sent on without the editor open */
+	const TArray<TSharedPtr<FJsonValue>>* Verdict;
+
+	if (Report->TryGetArrayField(TEXT("verdict"), Verdict)) {
+		for (const TSharedPtr<FJsonValue>& Line : *Verdict) {
+			UE_LOG(LogReflection, Error, TEXT("Cloud diagnosis of \"%s\": %s"), *Path, *Line->AsString());
+		}
+	}
+
+	const TSharedPtr<FJsonObject>* Build;
+
+	if (Report->TryGetObjectField(TEXT("build"), Build)) {
+		FString Profile, Game, Mappings;
+		(*Build)->TryGetStringField(TEXT("profile"), Profile);
+		(*Build)->TryGetStringField(TEXT("game"), Game);
+
+		if (const TSharedPtr<FJsonObject>* MappingsObject; (*Build)->TryGetObjectField(TEXT("mappings"), MappingsObject)) {
+			(*MappingsObject)->TryGetStringField(TEXT("loaded"), Mappings);
+		}
+
+		UE_LOG(LogReflection, Error, TEXT("Cloud diagnosis of \"%s\": profile \"%s\" reads the build as %s, mappings \"%s\""), *Path, *Profile, *Game, *Mappings);
+	}
+
+	const TArray<TSharedPtr<FJsonValue>>* Errors;
+
+	if (Report->TryGetArrayField(TEXT("errors"), Errors)) {
+		for (const TSharedPtr<FJsonValue>& ErrorValue : *Errors) {
+			const TSharedPtr<FJsonObject> Error = ErrorValue->AsObject();
+			if (!Error.IsValid()) continue;
+
+			FString Stage, Type, Message;
+			Error->TryGetStringField(TEXT("stage"), Stage);
+			Error->TryGetStringField(TEXT("type"), Type);
+			Error->TryGetStringField(TEXT("message"), Message);
+
+			UE_LOG(LogReflection, Error, TEXT("Cloud diagnosis of \"%s\": while %s: %s: %s"), *Path, *Stage, *Type, *Message);
+		}
+	}
+
+	FString Written;
+	const TSharedRef<TJsonWriter<>> Writer = TJsonWriterFactory<>::Create(&Written);
+	FJsonSerializer::Serialize(Report.ToSharedRef(), Writer);
+
+	FString Name = AssetName.IsEmpty() ? FPaths::GetBaseFilename(Path) : AssetName;
+
+	for (const TCHAR Bad : { TEXT('/'), TEXT('\\'), TEXT(':'), TEXT('.') }) {
+		Name.ReplaceCharInline(Bad, TEXT('_'));
+	}
+
+	const FString File = FPaths::ConvertRelativePathToFull(FPaths::ProjectSavedDir() / TEXT("Reflection") / TEXT("Diagnostics") / Name + TEXT(".mesh.json"));
+
+	if (!FFileHelper::SaveStringToFile(Written, *File)) {
+		UE_LOG(LogReflection, Warning, TEXT("The diagnosis of \"%s\" could not be written to \"%s\""), *Path, *File);
+
+		return FString();
+	}
+
+	UE_LOG(LogReflection, Error, TEXT("Cloud diagnosis of \"%s\" written to \"%s\""), *Path, *File);
+
+	return File;
 }
 
 TSharedPtr<FJsonObject> Cloud::Export::GetCurveExpressionsBlocking(const FString& Path) {
@@ -262,14 +357,8 @@ TSharedPtr<FJsonObject> Cloud::Export::GetDnaPosesBlocking(const FString& Path, 
 	return Response;
 }
 
-TSharedPtr<FJsonObject> Cloud::Export::GetReferenceSkeletonBlocking(const FString& Path) {
-	const TSharedPtr<FJsonObject> Response = Cloud::GetBlocking(ReferenceSkeletonURL, { { TEXT("path"), Path } }, {});
-
-	if (!Response.IsValid() || !Response->HasField(TEXT("bones"))) {
-		return nullptr;
-	}
-
-	return Response;
+TSharedPtr<FJsonObject> Cloud::Export::GetReferenceSkeletonBlocking(const FString& Path, FString* OutFailure) {
+	return GetGeometryBlocking(ReferenceSkeletonURL, TEXT("reference skeleton"), Path, TEXT("bones"), { { TEXT("path"), Path } }, OutFailure);
 }
 
 /* Fortnite cooks its heads with a RigLogic newer than this engine's. That cook leaves the DNA's
@@ -352,20 +441,14 @@ TSharedPtr<FJsonObject> Cloud::Export::GetMorphTargetsBlocking(const FString& Pa
 	return Response;
 }
 
-TSharedPtr<FJsonObject> Cloud::Export::GetStaticMeshBlocking(const FString& Path, const FString& Named) {
+TSharedPtr<FJsonObject> Cloud::Export::GetStaticMeshBlocking(const FString& Path, const FString& Named, FString* OutFailure) {
 	TMap<FString, FString> Parameters = { { TEXT("path"), Path } };
 
 	if (!Named.IsEmpty()) {
 		Parameters.Add(TEXT("export_name"), Named);
 	}
 
-	const TSharedPtr<FJsonObject> Response = Cloud::GetBlocking(StaticMeshURL, Parameters, {});
-
-	if (!Response.IsValid() || !Response->HasField(TEXT("lods"))) {
-		return nullptr;
-	}
-
-	return Response;
+	return GetGeometryBlocking(StaticMeshURL, TEXT("static mesh geometry"), Path, TEXT("lods"), Parameters, OutFailure);
 }
 
 bool Cloud::Export::GetBinaryBlocking(const FString& Path, const FString& ContentType, TArray<uint8>& OutData, const FString& Named) {

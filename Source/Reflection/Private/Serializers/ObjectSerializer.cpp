@@ -299,7 +299,11 @@ UObject* UObjectSerializer::SpawnExport(FUObjectExport* Export, const bool bOnly
 		}
 	}
 
-	if (!ObjectOuter && !Export->Object) return nullptr;
+	if (!ObjectOuter && !Export->Object) {
+		UE_LOG(LogReflection, Warning, TEXT("\"%s\" is not made: no outer \"%s\""), *Export->GetName().ToString(), *Outer);
+
+		return nullptr;
+	}
 
 	/* Default flags */
 	EObjectFlags Flags = RF_Public | RF_Transactional;
