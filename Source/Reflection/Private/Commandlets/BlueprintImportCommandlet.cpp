@@ -166,8 +166,6 @@ int32 UBlueprintImportCommandlet::Main(const FString& Params) {
 		}
 	}
 
-	IImporter* Importer = nullptr;
-
 	/* Built under the path given instead, so the copy at the real location is neither read back nor
 	 * written over. Spelled the way the cloud path is, since the class is named after it. */
 	FString Into = Path;

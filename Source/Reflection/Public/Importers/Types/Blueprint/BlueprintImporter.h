@@ -42,6 +42,10 @@ protected:
 	int32 ConstructOverriddenComponents();
 
 	/* Handles WidgetTree, the UI layout for Widget blueprints */
+	/* The most derived native class the functions of this asset name, where the dump says nothing
+	 * about the parent; null where they disagree or name nothing */
+	UClass* InferParentClass() const;
+
 	void ConstructWidgetTree();
 
 	/* Reads a widget tree out of another asset when this widget was cooked without one.

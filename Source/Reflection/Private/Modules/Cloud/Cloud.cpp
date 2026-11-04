@@ -247,14 +247,14 @@ FString Cloud::Export::DiagnoseMeshBlocking(const FString& Path, const FString& 
 		}
 	}
 
-	const TSharedPtr<FJsonObject>* Build;
+	const TSharedPtr<FJsonObject>* BuildObject;
 
-	if (Report->TryGetObjectField(TEXT("build"), Build)) {
+	if (Report->TryGetObjectField(TEXT("build"), BuildObject)) {
 		FString Profile, Game, Mappings;
-		(*Build)->TryGetStringField(TEXT("profile"), Profile);
-		(*Build)->TryGetStringField(TEXT("game"), Game);
+		(*BuildObject)->TryGetStringField(TEXT("profile"), Profile);
+		(*BuildObject)->TryGetStringField(TEXT("game"), Game);
 
-		if (const TSharedPtr<FJsonObject>* MappingsObject; (*Build)->TryGetObjectField(TEXT("mappings"), MappingsObject)) {
+		if (const TSharedPtr<FJsonObject>* MappingsObject; (*BuildObject)->TryGetObjectField(TEXT("mappings"), MappingsObject)) {
 			(*MappingsObject)->TryGetStringField(TEXT("loaded"), Mappings);
 		}
 
