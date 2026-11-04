@@ -123,6 +123,62 @@ TSharedPtr<FJsonObject> Cloud::GetBlocking(const FString& RequestURL, const TMap
 	return ParseResponse(FRemoteUtilities::ExecuteRequestBlocking(Request));
 }
 
+TSharedPtr<FJsonObject> Cloud::GetBlockingWithStatus(const FString& RequestURL, const TMap<FString, FString>& Parameters, const TMap<FString, FString>& Headers, int32& OutStatus) {
+	const FReflectionHttpRequest Request = BuildRequest(RequestURL, Parameters, Headers);
+	Request->SetVerb(TEXT("GET"));
+
+	const FReflectionHttpResponse Response = FRemoteUtilities::ExecuteRequestBlocking(Request);
+
+	OutStatus = Response.IsValid() ? Response->GetResponseCode() : 0;
+
+	if (!Response.IsValid() || !Response->GetHeader(TEXT("Content-Type")).Contains(TEXT("json"))) {
+		return nullptr;
+	}
+
+	TSharedPtr<FJsonObject> JsonObject;
+	const TSharedRef<TJsonReader<>> JsonReader = TJsonReaderFactory<>::Create(Response->GetContentAsString());
+
+	if (!FJsonSerializer::Deserialize(JsonReader, JsonObject)) {
+		return nullptr;
+	}
+
+	return JsonObject;
+}
+
+FString Cloud::DescribeRefusal(const TSharedPtr<FJsonObject>& Response, const int32 Status) {
+	if (Status == 0) {
+		return TEXT("the Cloud did not answer (is it running, and is a profile loaded?)");
+	}
+
+	if (!Response.IsValid()) {
+		return FString::Printf(TEXT("the Cloud answered %d with no json"), Status);
+	}
+
+	FString Code, Message, Exception, Game, Profile;
+
+	Response->TryGetStringField(TEXT("errorCode"), Code);
+	Response->TryGetStringField(TEXT("errorMessage"), Message);
+	Response->TryGetStringField(TEXT("exception"), Exception);
+	Response->TryGetStringField(TEXT("game"), Game);
+	Response->TryGetStringField(TEXT("profile"), Profile);
+
+	if (Code.IsEmpty() && Message.IsEmpty()) {
+		return FString::Printf(TEXT("the Cloud answered %d"), Status);
+	}
+
+	FString Said = FString::Printf(TEXT("%s (%s, %d)"), *Message, *Code, Status);
+
+	if (!Profile.IsEmpty() || !Game.IsEmpty()) {
+		Said += FString::Printf(TEXT(" on profile \"%s\" read as %s"), *Profile, *Game);
+	}
+
+	if (!Exception.IsEmpty()) {
+		Said += FString::Printf(TEXT(" (%s)"), *Exception);
+	}
+
+	return Said;
+}
+
 void Cloud::PumpRequests(const float DeltaSeconds) {
 	FHttpModule::Get().GetHttpManager().Tick(DeltaSeconds);
 }
