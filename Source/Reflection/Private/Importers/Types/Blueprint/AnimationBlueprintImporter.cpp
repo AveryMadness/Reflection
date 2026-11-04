@@ -1389,7 +1389,7 @@ void IAnimationBlueprintImporter::ReadBindings(const TSharedPtr<FJsonObject>& No
 	}
 }
 
-void IAnimationBlueprintImporter::Draw(UAnimGraphNode_Base* Node, const FName Member, const FString& Named, const bool bTurned, const int32 Row) const {
+void IAnimationBlueprintImporter::Draw(UAnimGraphNode_Base* Node, const FName Member, const TArray<FString>& Path, const bool bTurned, const int32 Row) const {
 	UEdGraph* Into = Node->GetGraph();
 
 	UEdGraphPin* Onto = Node->FindPin(Member, EGPD_Input);
@@ -1406,30 +1406,25 @@ void IAnimationBlueprintImporter::Draw(UAnimGraphNode_Base* Node, const FName Me
 		Onto = Node->FindPin(Member, EGPD_Input);
 	}
 
-	if (Into == nullptr || Onto == nullptr) {
-		if (Onto == nullptr) {
-			UE_LOG(LogReflection, Warning, TEXT("\"%s\" is handed to %s.%s, which has no pin and will not take one"),
-				*Named, *Node->GetName(), *Member.ToString());
-		}
-
-		return;
-	}
+	if (Into == nullptr || Onto == nullptr || Path.Num() == 0) return;
 
 	/* Drawn once. Saying it again is how a pin learns what it carries, and the run that draws it
 	 * would otherwise put down a second variable and a second Not every time it was asked. */
 	if (Onto->LinkedTo.Num() > 0) return;
 
+	const FString Named = FString::Join(Path, TEXT("."));
+
 	/* The variable, read where the node that wants it is */
-	UK2Node_VariableGet* Reads = NewObject<UK2Node_VariableGet>(Into, UK2Node_VariableGet::StaticClass(), NAME_None, RF_Transactional);
+	UK2Node_VariableGet* Reads = NewObject<UK2Node_VariableGet>(Into);
 
 	Into->AddNode(Reads, false, false);
 
 	Reads->CreateNewGuid();
-	Reads->VariableReference.SetSelfMember(FName(*Named));
+	Reads->VariableReference.SetSelfMember(FName(*Path[0]));
 	Reads->AllocateDefaultPins();
 	Reads->PostPlacedNewNode();
 
-	UEdGraphPin* Held = Reads->FindPin(FName(*Named), EGPD_Output);
+	UEdGraphPin* Held = Reads->FindPin(FName(*Path[0]), EGPD_Output);
 
 	if (Held == nullptr) {
 		UE_LOG(LogReflection, Warning, TEXT("\"%s\" is read for %s and hands nothing out"), *Named, *Member.ToString());
@@ -1437,9 +1432,48 @@ void IAnimationBlueprintImporter::Draw(UAnimGraphNode_Base* Node, const FName Me
 		return;
 	}
 
+	/* And each thing reached through it, by breaking open the struct that holds it */
+	for (int32 Step = 1; Step < Path.Num(); ++Step) {
+		UScriptStruct* Struct = Cast<UScriptStruct>(Held->PinType.PinSubCategoryObject.Get());
+
+		if (Struct == nullptr || Held->PinType.PinCategory != UEdGraphSchema_K2::PC_Struct) {
+			UE_LOG(LogReflection, Warning, TEXT("\"%s\" is read for %s, and \"%s\" is not a struct that can be broken open"), *Named, *Member.ToString(), *Path[Step - 1]);
+
+			return;
+		}
+
+		UK2Node_BreakStruct* Breaks = NewObject<UK2Node_BreakStruct>(Into);
+
+		Into->AddNode(Breaks, false, false);
+
+		Breaks->CreateNewGuid();
+		Breaks->StructType = Struct;
+		Breaks->AllocateDefaultPins();
+		Breaks->PostPlacedNewNode();
+
+		UEdGraphPin* Takes = Breaks->FindPin(Struct->GetFName(), EGPD_Input);
+		UEdGraphPin* Gives = Breaks->FindPin(FName(*Path[Step]), EGPD_Output);
+
+		if (Takes == nullptr || Gives == nullptr) {
+			UE_LOG(LogReflection, Warning, TEXT("\"%s\" is read for %s, and %s has no \"%s\" to hand out"), *Named, *Member.ToString(), *Struct->GetName(), *Path[Step]);
+
+			return;
+		}
+
+		Held->MakeLinkTo(Takes);
+
+		Breaks->NodePosX = Node->NodePosX - 220 * (bTurned ? 2 : 1) - 260 * (Path.Num() - 1 - Step);
+		Breaks->NodePosY = Node->NodePosY + Row * 90;
+
+		Held = Gives;
+	}
+
+	Reads->NodePosX = Node->NodePosX - 220 * (bTurned ? 2 : 1) - 260 * (Path.Num() - 1);
+	Reads->NodePosY = Node->NodePosY + Row * 90;
+
 	/* And the Not that turns it round, where it was turned round */
 	if (bTurned) {
-		UK2Node_CallFunction* Turns = NewObject<UK2Node_CallFunction>(Into, UK2Node_CallFunction::StaticClass(), NAME_None, RF_Transactional);
+		UK2Node_CallFunction* Turns = NewObject<UK2Node_CallFunction>(Into);
 
 		Into->AddNode(Turns, false, false);
 
@@ -1452,31 +1486,20 @@ void IAnimationBlueprintImporter::Draw(UAnimGraphNode_Base* Node, const FName Me
 		UEdGraphPin* Gives = Turns->GetReturnValuePin();
 
 		if (Takes == nullptr || Gives == nullptr) {
-			UE_LOG(LogReflection, Warning, TEXT("\"%s\" turned round for %s has nowhere to go"), *Named, *Member.ToString());
+			UE_LOG(LogReflection, Warning, TEXT("\"%s\" is turned round for %s, and Not has no \"%s\""), *Named, *Member.ToString(), Takes == nullptr ? TEXT("A") : TEXT("return value"));
 
 			return;
 		}
 
 		Held->MakeLinkTo(Takes);
-		Gives->MakeLinkTo(Onto);
 
 		Turns->NodePosX = Node->NodePosX - 220;
 		Turns->NodePosY = Node->NodePosY + Row * 90;
 
-		Reads->NodePosX = Turns->NodePosX - 220;
-		Reads->NodePosY = Turns->NodePosY;
-
-		Into->NotifyGraphChanged();
-
-		return;
+		Held = Gives;
 	}
 
 	Held->MakeLinkTo(Onto);
-
-	Reads->NodePosX = Node->NodePosX - 220;
-	Reads->NodePosY = Node->NodePosY + Row * 90;
-
-	Into->NotifyGraphChanged();
 }
 
 void IAnimationBlueprintImporter::Hands(const FString& Key, const FName Member, const TArray<FString>& Path, const bool bTurned) {
@@ -2166,7 +2189,38 @@ void IAnimationBlueprintImporter::CreateAnimGraphNodes(UEdGraph* AnimGraph, cons
 		TSharedPtr<FJsonObject> Value = Pair.Value->AsObject();
 
 		/* Find the NodeType and GUID from the key */
+		/* Find the NodeType and GUID from the key */
+		FString NodeStringGUID; {
+			FString Front;
+
+			Key.Split(TEXT("_"), &Front, &NodeStringGUID, ESearchCase::IgnoreCase, ESearchDir::FromEnd);
+
+			if (Key.Contains(TEXT("["))) NodeStringGUID.Empty();
+		}
+
 		const FString NodeType = NodeKindFromKey(Key);
+
+		/* Only add json object data, transition result is handled different */
+		if (NodeType == "AnimGraphNode_TransitionResult") {
+			OutContainer.Exports.Add(
+				new FUObjectExport(
+					FName(*Key),
+					FName(*NodeType),
+					StringToName(AnimGraph->GetName()),
+					Value,
+					nullptr,
+					nullptr
+				)
+			);
+
+			continue;
+		}
+
+		FGuid NodeGuid; {
+			FGuid::Parse(NodeStringGUID, NodeGuid);
+
+			if (!NodeGuid.IsValid()) NodeGuid = FGuid::NewGuid();
+		}
 
 		const UClass* Class = FindClassByType(NodeType);
 
@@ -2533,7 +2587,9 @@ void IAnimationBlueprintImporter::HandleNodeDeserialization(FUObjectExportContai
 		
 				if (UAnimGraphNode_BlendListByEnum* BlendList = Cast<UAnimGraphNode_BlendListByEnum>(Node)) {
 			if (UEnum* Found = InferBlendListEnum(BlendList, NodeProperties)) {
-				BlendList->Node.BoundEnum = Found;
+				if (const FObjectProperty* Keeps = CastField<FObjectProperty>(BlendList->GetClass()->FindPropertyByName(TEXT("BoundEnum")))) {
+					Keeps->SetObjectPropertyValue_InContainer(BlendList, Found);
+				}
 			}
 		}
 
