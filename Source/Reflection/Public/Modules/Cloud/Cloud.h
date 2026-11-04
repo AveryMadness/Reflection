@@ -230,6 +230,15 @@ public:
 
 	static TSharedPtr<FJsonObject> GetBlocking(const FString& RequestURL, const TMap<FString, FString>& Parameters = {}, const TMap<FString, FString>& Headers = {});
 
+	/* The same, but a refusal is handed back too: the Cloud answers a mesh it cannot serve with
+	 * a body saying why, under a status that GetBlocking throws away. OutStatus is the HTTP
+	 * status, or 0 when the Cloud never answered. */
+	static TSharedPtr<FJsonObject> GetBlockingWithStatus(const FString& RequestURL, const TMap<FString, FString>& Parameters, const TMap<FString, FString>& Headers, int32& OutStatus);
+
+	/* What a Cloud refusal says, in one line: its error code and message, and the exception
+	 * where it carried one. */
+	static FString DescribeRefusal(const TSharedPtr<FJsonObject>& Response, int32 Status);
+
 	/* The same as Post, waited on. OutResponseCode is filled whether or not the body parsed, and
 	 * is zero when the request never reached the Cloud. */
 	static TSharedPtr<FJsonObject> PostBlocking(const FString& RequestURL, const FString& Body, const TMap<FString, FString>& Headers = {}, int32* OutResponseCode = nullptr);

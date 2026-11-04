@@ -2047,17 +2047,6 @@ void inline LinkPoseInputPin(const FString& PinName, UAnimGraphNode_Base* Node, 
 			: TEXT("what feeds it hands nothing out"));
 }
 
-/* Or the value itself, where it was cooked with its enum's name on it */
-	if (FString Spelled; Properties.IsValid() && Properties->TryGetStringField(TEXT("ActiveEnumValue"), Spelled)) {
-		FString EnumName;
-
-		if (Spelled.Split(TEXT("::"), &EnumName, nullptr)) {
-			if (UEnum* Found = FindEnumByType(EnumName)) return Found;
-		}
-	}
-
-	return nullptr;
-}
 
 void IAnimationBlueprintImporter::UpdateBlendListByEnumVisibleEntries(FUObjectExport* NodeExport, FUObjectExportContainer* Container, UEdGraph* AnimGraph) {
 	TSharedPtr<FJsonObject> NodeJsonObject = NodeExport->JsonObject;
